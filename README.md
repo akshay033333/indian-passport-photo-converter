@@ -10,7 +10,7 @@ This Streamlit app accepts a JPEG portrait and converts it into a passport-style
 ## Run locally with Python
 
 ```bash
-cd /Users/akshaykailasa/Documents/photo_passport_app
+cd /your path 
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -28,7 +28,7 @@ http://localhost:8501
 Build the Docker image:
 
 ```bash
-cd /Users/akshaykailasa/Documents/photo_passport_app
+cd your project path
 docker build -t passport-photo-app .
 ```
 
@@ -49,7 +49,7 @@ http://localhost:8501
 Create an empty repository on GitHub, GitLab, or Bitbucket first, then run:
 
 ```bash
-cd /Users/akshaykailasa/Documents/photo_passport_app
+cd /your project path
 git remote add origin <YOUR_REPOSITORY_URL>
 git push -u origin codex/passport-photo-app
 ```
