@@ -7,7 +7,7 @@ This Streamlit app accepts a JPEG portrait and converts it into a passport-style
 - plain white or off-white background
 - head-and-shoulders framing aimed at `80-85%` face coverage
 
-## Run locally
+## Run locally with Python
 
 ```bash
 cd /Users/akshaykailasa/Documents/photo_passport_app
@@ -17,8 +17,60 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+Then open:
+
+```text
+http://localhost:8501
+```
+
+## Run with Docker
+
+Build the Docker image:
+
+```bash
+cd /Users/akshaykailasa/Documents/photo_passport_app
+docker build -t passport-photo-app .
+```
+
+Run the container:
+
+```bash
+docker run --rm -p 8501:8501 passport-photo-app
+```
+
+Then open:
+
+```text
+http://localhost:8501
+```
+
+## Push to a Git repository
+
+Create an empty repository on GitHub, GitLab, or Bitbucket first, then run:
+
+```bash
+cd /Users/akshaykailasa/Documents/photo_passport_app
+git remote add origin <YOUR_REPOSITORY_URL>
+git push -u origin codex/passport-photo-app
+```
+
+Example repository URLs:
+
+```text
+https://github.com/your-user/passport-photo-app.git
+git@github.com:your-user/passport-photo-app.git
+```
+
+If you want the branch to be `main` instead of `codex/passport-photo-app`, run:
+
+```bash
+git branch -M main
+git push -u origin main
+```
+
 ## Notes
 
 - The app uses OpenCV face detection to crop around the face automatically.
 - It then applies a foreground extraction step and composites the result over an off-white background.
 - If a face is not detected, it falls back to a centered crop.
+- Docker is useful if you want a consistent runtime on your laptop, server, or cloud VM.
