@@ -4,5 +4,4 @@ Pillow>=10.0,<12
 numpy>=1.26,<3
 gspread>=6.0,<7
 google-auth>=2.0,<3
-pillow-heif>=0.18,<1
 psutil>=5.9,<7
