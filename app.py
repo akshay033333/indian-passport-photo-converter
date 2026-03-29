@@ -15,10 +15,12 @@ import numpy as np
 import streamlit as st
 from PIL import Image
 from streamlit.errors import StreamlitSecretNotFoundError
+HEIF_ENABLED = False
 try:
     from pillow_heif import register_heif_opener  # pyright: ignore[reportMissingImports]
 
     register_heif_opener()
+    HEIF_ENABLED = True
 except Exception:
     pass
 
@@ -380,8 +382,11 @@ def enqueue_traffic_event(event_name: str, session_id: str, details: str = "") -
 
 
 def validate_uploaded_file_bytes(file_bytes: bytes, mime_type: str = "") -> tuple[bool, str]:
-    allowed_mime_types = {"image/jpeg", "image/jpg", "image/png", "image/heic", "image/heif"}
-    allowed_pil_formats = {"JPEG", "PNG", "HEIF"}
+    allowed_mime_types = {"image/jpeg", "image/jpg", "image/png"}
+    allowed_pil_formats = {"JPEG", "PNG"}
+    if HEIF_ENABLED:
+        allowed_mime_types.update({"image/heic", "image/heif"})
+        allowed_pil_formats.add("HEIF")
     file_size = len(file_bytes)
 
     if file_size > MAX_UPLOAD_SIZE_BYTES:
@@ -403,7 +408,9 @@ def validate_uploaded_file_bytes(file_bytes: bytes, mime_type: str = "") -> tupl
         return False, "Uploaded file is not a valid image."
 
     if image_format not in allowed_pil_formats:
-        return False, "Only JPG, JPEG, PNG, HEIC, and HEIF files are allowed."
+        if HEIF_ENABLED:
+            return False, "Only JPG, JPEG, PNG, HEIC, and HEIF files are allowed."
+        return False, "Only JPG, JPEG, and PNG files are allowed."
 
     if width < MIN_UPLOAD_WIDTH or height < MIN_UPLOAD_HEIGHT:
         return False, "Image resolution must be at least 300 x 300 pixels."
@@ -535,13 +542,19 @@ def main() -> None:
         st.session_state["visit_logged"] = True
 
     st.title("Passport Photo Formatter")
+    allowed_text = "JPG, JPEG, and PNG"
+    upload_types = ["jpg", "jpeg", "png"]
+    if HEIF_ENABLED:
+        allowed_text = "JPG, JPEG, PNG, HEIC, and HEIF"
+        upload_types.extend(["heic", "heif"])
+
     st.write(
-        "Upload a JPG, JPEG, PNG, HEIC, or HEIF portrait and export a `630 x 810` image with a white background, "
+        f"Upload a {allowed_text} portrait and export a `630 x 810` image with a white background, "
         "tight head-and-shoulders framing, and a JPEG size target under `250 KB`."
     )
     uploaded_file = st.file_uploader(
-        "Upload a JPG, JPEG, PNG, HEIC, or HEIF image",
-        type=["jpg", "jpeg", "png", "heic", "heif"],
+        f"Upload a {allowed_text} image",
+        type=upload_types,
         key=f"passport_uploader_{st.session_state['uploader_nonce']}",
     )
 
