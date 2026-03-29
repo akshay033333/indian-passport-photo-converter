@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import io
+import json
+from datetime import datetime, timezone
 from dataclasses import dataclass
 
 import cv2
+import gspread
 import numpy as np
 import streamlit as st
 from PIL import Image
+from streamlit.errors import StreamlitSecretNotFoundError
 
 
 OUTPUT_WIDTH = 630
@@ -83,35 +87,58 @@ def compute_crop_box(image_w: int, image_h: int, face: FaceBox) -> tuple[int, in
     return int(round(left)), int(round(top)), int(round(right)), int(round(bottom))
 
 
-def whiten_background(image_bgr: np.ndarray) -> np.ndarray:
+def whiten_background(image_bgr: np.ndarray, face_hint: FaceBox | None = None) -> tuple[np.ndarray, bool]:
     h, w = image_bgr.shape[:2]
-    mask = np.zeros((h, w), np.uint8)
+    mask = np.full((h, w), cv2.GC_PR_BGD, np.uint8)
     bg_model = np.zeros((1, 65), np.float64)
     fg_model = np.zeros((1, 65), np.float64)
 
-    margin_x = max(10, int(w * 0.08))
-    margin_y = max(10, int(h * 0.06))
-    rect = (margin_x, margin_y, max(1, w - 2 * margin_x), max(1, h - 2 * margin_y))
+    border_x = max(8, int(w * 0.03))
+    border_y = max(8, int(h * 0.03))
+    mask[:border_y, :] = cv2.GC_BGD
+    mask[-border_y:, :] = cv2.GC_BGD
+    mask[:, :border_x] = cv2.GC_BGD
+    mask[:, -border_x:] = cv2.GC_BGD
+
+    center_margin_x = max(20, int(w * 0.18))
+    center_margin_y = max(20, int(h * 0.12))
+    mask[
+        center_margin_y:h - center_margin_y,
+        center_margin_x:w - center_margin_x,
+    ] = cv2.GC_PR_FGD
+
+    if face_hint is not None:
+        left = int(clamp(face_hint.x - face_hint.w * 0.9, 0, w - 1))
+        top = int(clamp(face_hint.y - face_hint.h * 1.2, 0, h - 1))
+        right = int(clamp(face_hint.x + face_hint.w * 1.9, 1, w))
+        bottom = int(clamp(face_hint.y + face_hint.h * 3.2, 1, h))
+        if right > left and bottom > top:
+            mask[top:bottom, left:right] = cv2.GC_FGD
 
     try:
-        cv2.grabCut(image_bgr, mask, rect, bg_model, fg_model, 4, cv2.GC_INIT_WITH_RECT)
+        cv2.grabCut(image_bgr, mask, None, bg_model, fg_model, 5, cv2.GC_INIT_WITH_MASK)
         foreground = np.where((mask == 1) | (mask == 3), 255, 0).astype(np.uint8)
     except cv2.error:
         foreground = np.full((h, w), 255, dtype=np.uint8)
 
     kernel = np.ones((5, 5), np.uint8)
     foreground = cv2.morphologyEx(foreground, cv2.MORPH_CLOSE, kernel, iterations=1)
+    foreground = cv2.dilate(foreground, kernel, iterations=1)
     foreground = cv2.GaussianBlur(foreground, (7, 7), 0)
+
+    fg_ratio = float(np.count_nonzero(foreground)) / float(h * w)
+    if fg_ratio < 0.18:
+        return image_bgr, False
 
     alpha = foreground.astype(np.float32) / 255.0
     alpha = alpha[..., None]
 
     white_bg = np.full_like(image_bgr, 252)
     blended = image_bgr.astype(np.float32) * alpha + white_bg.astype(np.float32) * (1 - alpha)
-    return blended.astype(np.uint8)
+    return blended.astype(np.uint8), True
 
 
-def build_passport_photo(image: Image.Image) -> tuple[Image.Image, bool]:
+def build_passport_photo(image: Image.Image) -> tuple[Image.Image, bool, bool]:
     image_bgr = pil_to_bgr(image)
     face = detect_primary_face(image_bgr)
 
@@ -122,9 +149,10 @@ def build_passport_photo(image: Image.Image) -> tuple[Image.Image, bool]:
     else:
         image_bgr = center_crop_to_aspect(image_bgr, OUTPUT_WIDTH / OUTPUT_HEIGHT)
 
-    image_bgr = whiten_background(image_bgr)
+    face_after_crop = detect_primary_face(image_bgr)
+    image_bgr, background_refined = whiten_background(image_bgr, face_after_crop)
     image_bgr = cv2.resize(image_bgr, (OUTPUT_WIDTH, OUTPUT_HEIGHT), interpolation=cv2.INTER_CUBIC)
-    return bgr_to_pil(image_bgr), face_found
+    return bgr_to_pil(image_bgr), face_found, background_refined
 
 
 def center_crop_to_aspect(image_bgr: np.ndarray, target_aspect: float) -> np.ndarray:
@@ -141,69 +169,186 @@ def center_crop_to_aspect(image_bgr: np.ndarray, target_aspect: float) -> np.nda
     return image_bgr[start_y:start_y + new_h, :]
 
 
+def strip_image_metadata(image: Image.Image) -> Image.Image:
+    # Rebuild the image from raw pixels so source metadata/EXIF is not carried over.
+    pixel_data = np.array(image.convert("RGB"))
+    return Image.fromarray(pixel_data, mode="RGB")
+
+
 def encode_under_limit(image: Image.Image, size_limit: int = MAX_FILE_SIZE_BYTES) -> tuple[bytes, int]:
+    clean_image = strip_image_metadata(image)
     for quality in range(95, 29, -5):
         buffer = io.BytesIO()
-        image.save(buffer, format="JPEG", quality=quality, optimize=True)
+        clean_image.save(buffer, format="JPEG", quality=quality, optimize=True, exif=b"")
         data = buffer.getvalue()
         if len(data) <= size_limit:
             return data, quality
 
     buffer = io.BytesIO()
-    image.save(buffer, format="JPEG", quality=25, optimize=True)
+    clean_image.save(buffer, format="JPEG", quality=25, optimize=True, exif=b"")
     return buffer.getvalue(), 25
+
+
+def normalize_uploaded_image(uploaded_file: io.BytesIO) -> Image.Image:
+    image = Image.open(uploaded_file)
+    if image.mode in ("RGBA", "LA") or (image.mode == "P" and "transparency" in image.info):
+        rgba_image = image.convert("RGBA")
+        white_bg = Image.new("RGBA", rgba_image.size, (255, 255, 255, 255))
+        return Image.alpha_composite(white_bg, rgba_image).convert("RGB")
+
+    return image.convert("RGB")
+
+
+def clear_photo_session() -> None:
+    st.session_state["uploader_nonce"] = st.session_state.get("uploader_nonce", 0) + 1
+    st.rerun()
+
+
+@st.cache_resource(show_spinner=False)
+def get_google_sheet_client(service_account_info: dict) -> gspread.Client:
+    return gspread.service_account_from_dict(service_account_info)
+
+
+def safe_get_secret(key: str, default: str | None = None) -> str | None:
+    try:
+        return st.secrets.get(key, default)
+    except StreamlitSecretNotFoundError:
+        return default
+
+
+def append_feedback_to_google_sheet(feedback_text: str) -> tuple[bool, str]:
+    service_account_secret = safe_get_secret("GOOGLE_SERVICE_ACCOUNT_JSON")
+    sheet_id = safe_get_secret("GOOGLE_SHEET_ID")
+    worksheet_name = safe_get_secret("GOOGLE_SHEET_WORKSHEET", "feedback")
+
+    if not service_account_secret or not sheet_id:
+        return (
+            False,
+            "Feedback storage is not configured yet. Please set GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_SHEET_ID.",
+        )
+
+    try:
+        if isinstance(service_account_secret, str):
+            service_account_info = json.loads(service_account_secret)
+        else:
+            service_account_info = dict(service_account_secret)
+
+        client = get_google_sheet_client(service_account_info)
+        spreadsheet = client.open_by_key(sheet_id)
+
+        try:
+            worksheet = spreadsheet.worksheet(worksheet_name)
+        except gspread.WorksheetNotFound:
+            worksheet = spreadsheet.add_worksheet(title=worksheet_name, rows=1000, cols=2)
+
+        first_row = worksheet.row_values(1)
+        if not first_row:
+            worksheet.append_row(["submitted_at_utc", "feedback"], value_input_option="RAW")
+
+        worksheet.append_row(
+            [datetime.now(timezone.utc).isoformat(), feedback_text.strip()],
+            value_input_option="RAW",
+        )
+        return True, "Thank you for your feedback. It has been saved."
+    except Exception as exc:
+        return False, f"Could not submit feedback to Google Sheets: {exc}"
+
+
+def render_feedback_section() -> None:
+    st.divider()
+    st.subheader("Feedback")
+    st.write("Please let us know if you face any issues.")
+    st.session_state.setdefault("feedback_nonce", 0)
+    feedback_key = f"feedback_text_{st.session_state['feedback_nonce']}"
+    feedback_text = st.text_area(
+        "Share your feedback",
+        key=feedback_key,
+        placeholder="Tell us what went wrong or how we can improve...",
+    )
+    if st.button("Submit feedback"):
+        if not feedback_text.strip():
+            st.warning("Please enter feedback before submitting.")
+            return
+
+        ok, message = append_feedback_to_google_sheet(feedback_text)
+        if ok:
+            st.session_state["feedback_submitted_toast"] = "Feedback submitted successfully."
+            st.session_state["feedback_nonce"] += 1
+            st.rerun()
+        else:
+            st.error(message)
 
 
 def main() -> None:
     st.set_page_config(page_title="Passport Photo Formatter", page_icon="📷", layout="centered")
+    st.session_state.setdefault("uploader_nonce", 0)
+    if "feedback_submitted_toast" in st.session_state:
+        st.toast(st.session_state.pop("feedback_submitted_toast"), icon="✅")
 
     st.title("Passport Photo Formatter")
     st.write(
-        "Upload a JPEG portrait and export a `630 x 810` image with a white background, "
+        "Upload a JPG, JPEG, or PNG portrait and export a `630 x 810` image with a white background, "
         "tight head-and-shoulders framing, and a JPEG size target under `250 KB`."
     )
-
-    uploaded_file = st.file_uploader("Upload a JPEG image", type=["jpg", "jpeg"])
+    uploaded_file = st.file_uploader(
+        "Upload a JPG, JPEG, or PNG image",
+        type=["jpg", "jpeg", "png"],
+        key=f"passport_uploader_{st.session_state['uploader_nonce']}",
+    )
 
     st.caption(
         "Target spec: `630x810 px`, plain white/off-white background, "
         "face framed to roughly `80-85%` passport-style coverage."
     )
 
-    if not uploaded_file:
-        return
+    if uploaded_file:
+        source_image = normalize_uploaded_image(uploaded_file)
+        result_image, face_found, background_refined = build_passport_photo(source_image)
+        encoded_bytes, quality = encode_under_limit(result_image)
 
-    source_image = Image.open(uploaded_file).convert("RGB")
-    result_image, face_found = build_passport_photo(source_image)
-    encoded_bytes, quality = encode_under_limit(result_image)
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("Original")
+            st.image(source_image, use_container_width=True)
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Original")
-        st.image(source_image, use_container_width=True)
+        with col2:
+            st.subheader("Formatted")
+            st.image(result_image, use_container_width=True)
 
-    with col2:
-        st.subheader("Formatted")
-        st.image(result_image, use_container_width=True)
-
-    st.success(
-        f"Export ready: `630x810 px`, `{len(encoded_bytes) / 1024:.1f} KB`, JPEG quality `{quality}`."
-    )
-
-    if face_found:
-        st.info("Face detection succeeded and the crop was aligned around the detected face.")
-    else:
-        st.warning(
-            "No face was detected, so the app used a centered crop. "
-            "For best results, upload a clear front-facing portrait."
+        st.success(
+            f"Export ready: `630x810 px`, `{len(encoded_bytes) / 1024:.1f} KB`, JPEG quality `{quality}`."
         )
 
-    st.download_button(
-        label="Download formatted JPEG",
-        data=encoded_bytes,
-        file_name="passport_photo_630x810.jpg",
-        mime="image/jpeg",
-    )
+        if face_found:
+            st.info("Face detection succeeded and the crop was aligned around the detected face.")
+        else:
+            st.warning(
+                "No face was detected, so the app used a centered crop. "
+                "For best results, upload a clear front-facing portrait."
+            )
+
+        if not background_refined:
+            st.warning(
+                "Background cleanup was partially skipped to preserve hair/body details. "
+                "Try a photo with better lighting and clearer contrast for best white-background results."
+            )
+
+        st.download_button(
+            label="Download formatted JPEG",
+            data=encoded_bytes,
+            file_name="passport_photo_630x810.jpg",
+            mime="image/jpeg",
+        )
+
+        action_col1, action_col2 = st.columns(2)
+        with action_col1:
+            if st.button("Clear"):
+                clear_photo_session()
+        with action_col2:
+            if st.button("I'm done"):
+                clear_photo_session()
+
+    render_feedback_section()
 
 
 if __name__ == "__main__":
