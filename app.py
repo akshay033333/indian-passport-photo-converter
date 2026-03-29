@@ -406,7 +406,6 @@ def main() -> None:
         st.toast(st.session_state.pop("feedback_submitted_toast"), icon="✅")
     session_id = get_or_create_session_id()
     active_count, total_visits = register_runtime_traffic(session_id)
-    st.caption(f"Live active users: `{active_count}` | Visits (runtime): `{total_visits}`")
     if not st.session_state.get("visit_logged"):
         append_traffic_to_google_sheet("app_visit", session_id, "home_loaded")
         st.session_state["visit_logged"] = True
@@ -486,6 +485,7 @@ def main() -> None:
                 clear_photo_session()
 
     render_feedback_section()
+    st.caption(f"Live active users: `{active_count}` | Visits (runtime): `{total_visits}`")
 
 
 if __name__ == "__main__":
