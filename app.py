@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import io
 import json
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from dataclasses import dataclass
 
@@ -21,9 +23,17 @@ MAX_FILE_SIZE_BYTES = 250 * 1024
 MAX_UPLOAD_SIZE_BYTES = 350 * 1024 * 1024
 MIN_UPLOAD_WIDTH = 300
 MIN_UPLOAD_HEIGHT = 300
+MAX_UPLOAD_PIXELS = 40_000_000
 MIN_FEEDBACK_CHARS = 10
 MAX_FEEDBACK_CHARS = 1000
 SESSION_ACTIVE_WINDOW_SECONDS = 5 * 60
+MAX_BACKGROUND_LOG_QUEUE = 200
+MAX_SHEET_WRITE_RETRIES = 3
+SHEET_RETRY_BASE_DELAY_SECONDS = 0.4
+UPLOAD_COOLDOWN_SECONDS = 2
+FEEDBACK_COOLDOWN_SECONDS = 10
+MAX_UPLOADS_PER_SESSION_PER_HOUR = 120
+MAX_FEEDBACK_PER_SESSION_PER_HOUR = 30
 
 
 @dataclass
@@ -227,7 +237,21 @@ def safe_get_secret(key: str, default: str | None = None) -> str | None:
 
 @st.cache_resource(show_spinner=False)
 def get_runtime_traffic_state() -> dict[str, dict]:
-    return {"sessions_last_seen": {}, "visited_sessions": {}}
+    return {
+        "sessions_last_seen": {},
+        "visited_sessions": {},
+        "lock": threading.Lock(),
+    }
+
+
+@st.cache_resource(show_spinner=False)
+def get_background_log_executor() -> ThreadPoolExecutor:
+    return ThreadPoolExecutor(max_workers=4, thread_name_prefix="traffic-logger")
+
+
+@st.cache_resource(show_spinner=False)
+def get_background_log_semaphore() -> threading.BoundedSemaphore:
+    return threading.BoundedSemaphore(MAX_BACKGROUND_LOG_QUEUE)
 
 
 def get_or_create_session_id() -> str:
@@ -239,39 +263,56 @@ def get_or_create_session_id() -> str:
 def register_runtime_traffic(session_id: str) -> tuple[int, int]:
     state = get_runtime_traffic_state()
     now_ts = time.time()
-    state["sessions_last_seen"][session_id] = now_ts
-    state["visited_sessions"][session_id] = True
+    with state["lock"]:
+        state["sessions_last_seen"][session_id] = now_ts
+        state["visited_sessions"][session_id] = True
 
-    stale_sessions = [
-        sid
-        for sid, last_seen in state["sessions_last_seen"].items()
-        if now_ts - last_seen > SESSION_ACTIVE_WINDOW_SECONDS
-    ]
-    for sid in stale_sessions:
-        state["sessions_last_seen"].pop(sid, None)
+        stale_sessions = [
+            sid
+            for sid, last_seen in state["sessions_last_seen"].items()
+            if now_ts - last_seen > SESSION_ACTIVE_WINDOW_SECONDS
+        ]
+        for sid in stale_sessions:
+            state["sessions_last_seen"].pop(sid, None)
 
-    active_count = len(state["sessions_last_seen"])
-    total_visits = len(state["visited_sessions"])
+        active_count = len(state["sessions_last_seen"])
+        total_visits = len(state["visited_sessions"])
     return active_count, total_visits
 
 
-def append_traffic_to_google_sheet(event_name: str, session_id: str, details: str = "") -> tuple[bool, str]:
+def get_service_account_info() -> tuple[dict | None, str | None]:
     service_account_secret = safe_get_secret("GOOGLE_SERVICE_ACCOUNT_JSON")
     sheet_id = safe_get_secret("GOOGLE_SHEET_ID")
+    if not service_account_secret or not sheet_id:
+        return None, None
+
+    if isinstance(service_account_secret, str):
+        return json.loads(service_account_secret), sheet_id
+    return dict(service_account_secret), sheet_id
+
+
+def append_row_with_retries(worksheet: gspread.Worksheet, row: list[str]) -> None:
+    for attempt in range(MAX_SHEET_WRITE_RETRIES):
+        try:
+            worksheet.append_row(row, value_input_option="RAW")
+            return
+        except Exception:
+            if attempt == MAX_SHEET_WRITE_RETRIES - 1:
+                raise
+            time.sleep(SHEET_RETRY_BASE_DELAY_SECONDS * (2**attempt))
+
+
+def append_traffic_to_google_sheet(event_name: str, session_id: str, details: str = "") -> tuple[bool, str]:
+    service_account_info, sheet_id = get_service_account_info()
     worksheet_name = safe_get_secret("GOOGLE_TRAFFIC_WORKSHEET", "traffic")
 
-    if not service_account_secret or not sheet_id:
+    if not service_account_info or not sheet_id:
         return (
             False,
             "Traffic storage is not configured. Please set GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_SHEET_ID.",
         )
 
     try:
-        if isinstance(service_account_secret, str):
-            service_account_info = json.loads(service_account_secret)
-        else:
-            service_account_info = dict(service_account_secret)
-
         client = get_google_sheet_client(service_account_info)
         spreadsheet = client.open_by_key(sheet_id)
 
@@ -282,22 +323,41 @@ def append_traffic_to_google_sheet(event_name: str, session_id: str, details: st
 
         first_row = worksheet.row_values(1)
         if not first_row:
-            worksheet.append_row(
+            append_row_with_retries(
+                worksheet,
                 ["submitted_at_utc", "session_id", "event_name", "details"],
-                value_input_option="RAW",
             )
 
-        worksheet.append_row(
+        append_row_with_retries(
+            worksheet,
             [datetime.now(timezone.utc).isoformat(), session_id, event_name, details],
-            value_input_option="RAW",
         )
         return True, "Traffic event saved."
     except Exception as exc:
-        return False, f"Could not save traffic event: {exc}"
+        print(f"Traffic write error: {exc}")
+        return False, "Could not save traffic event right now."
+
+
+def enqueue_traffic_event(event_name: str, session_id: str, details: str = "") -> None:
+    semaphore = get_background_log_semaphore()
+    if not semaphore.acquire(blocking=False):
+        # Drop excess analytics events under burst load to protect core app UX.
+        return
+
+    executor = get_background_log_executor()
+
+    def _run() -> None:
+        try:
+            append_traffic_to_google_sheet(event_name, session_id, details)
+        finally:
+            semaphore.release()
+
+    executor.submit(_run)
 
 
 def validate_uploaded_file(uploaded_file: io.BytesIO) -> tuple[bool, str]:
     allowed_mime_types = {"image/jpeg", "image/jpg", "image/png"}
+    allowed_pil_formats = {"JPEG", "PNG"}
     file_size = getattr(uploaded_file, "size", None)
     if file_size is None:
         file_size = len(uploaded_file.getbuffer())
@@ -313,13 +373,19 @@ def validate_uploaded_file(uploaded_file: io.BytesIO) -> tuple[bool, str]:
         uploaded_file.seek(0)
         with Image.open(uploaded_file) as image:
             width, height = image.size
+            image_format = (image.format or "").upper()
     except Exception:
         return False, "Uploaded file is not a valid image."
     finally:
         uploaded_file.seek(0)
 
+    if image_format not in allowed_pil_formats:
+        return False, "Only JPG, JPEG, and PNG files are allowed."
+
     if width < MIN_UPLOAD_WIDTH or height < MIN_UPLOAD_HEIGHT:
         return False, "Image resolution must be at least 300 x 300 pixels."
+    if width * height > MAX_UPLOAD_PIXELS:
+        return False, "Image resolution is too high. Please upload up to 40 megapixels."
 
     return True, ""
 
@@ -333,23 +399,41 @@ def validate_feedback_text(feedback_text: str) -> tuple[bool, str]:
     return True, ""
 
 
+def enforce_session_rate_limit(
+    action: str,
+    cooldown_seconds: int,
+    max_actions_per_hour: int,
+) -> tuple[bool, str]:
+    now_ts = time.time()
+    state_key = f"rate_limit_{action}"
+    rate_state = st.session_state.setdefault(state_key, {"last_ts": 0.0, "events": []})
+
+    recent_events = [ts for ts in rate_state["events"] if now_ts - ts < 3600]
+    rate_state["events"] = recent_events
+
+    if now_ts - float(rate_state.get("last_ts", 0.0)) < cooldown_seconds:
+        wait_seconds = int(cooldown_seconds - (now_ts - float(rate_state["last_ts"]))) + 1
+        return False, f"Please wait {wait_seconds} seconds before trying again."
+
+    if len(recent_events) >= max_actions_per_hour:
+        return False, "Rate limit reached for this session. Please try again later."
+
+    rate_state["last_ts"] = now_ts
+    rate_state["events"].append(now_ts)
+    return True, ""
+
+
 def append_feedback_to_google_sheet(feedback_text: str) -> tuple[bool, str]:
-    service_account_secret = safe_get_secret("GOOGLE_SERVICE_ACCOUNT_JSON")
-    sheet_id = safe_get_secret("GOOGLE_SHEET_ID")
+    service_account_info, sheet_id = get_service_account_info()
     worksheet_name = safe_get_secret("GOOGLE_SHEET_WORKSHEET", "feedback")
 
-    if not service_account_secret or not sheet_id:
+    if not service_account_info or not sheet_id:
         return (
             False,
             "Feedback storage is not configured yet. Please set GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_SHEET_ID.",
         )
 
     try:
-        if isinstance(service_account_secret, str):
-            service_account_info = json.loads(service_account_secret)
-        else:
-            service_account_info = dict(service_account_secret)
-
         client = get_google_sheet_client(service_account_info)
         spreadsheet = client.open_by_key(sheet_id)
 
@@ -360,15 +444,13 @@ def append_feedback_to_google_sheet(feedback_text: str) -> tuple[bool, str]:
 
         first_row = worksheet.row_values(1)
         if not first_row:
-            worksheet.append_row(["submitted_at_utc", "feedback"], value_input_option="RAW")
+            append_row_with_retries(worksheet, ["submitted_at_utc", "feedback"])
 
-        worksheet.append_row(
-            [datetime.now(timezone.utc).isoformat(), feedback_text.strip()],
-            value_input_option="RAW",
-        )
+        append_row_with_retries(worksheet, [datetime.now(timezone.utc).isoformat(), feedback_text.strip()])
         return True, "Thank you for your feedback. It has been saved."
     except Exception as exc:
-        return False, f"Could not submit feedback to Google Sheets: {exc}"
+        print(f"Feedback write error: {exc}")
+        return False, "Could not submit feedback right now. Please try again later."
 
 
 def render_feedback_section() -> None:
@@ -383,6 +465,15 @@ def render_feedback_section() -> None:
         placeholder="Tell us what went wrong or how we can improve...",
     )
     if st.button("Submit feedback"):
+        allowed, rate_limit_message = enforce_session_rate_limit(
+            action="feedback_submit",
+            cooldown_seconds=FEEDBACK_COOLDOWN_SECONDS,
+            max_actions_per_hour=MAX_FEEDBACK_PER_SESSION_PER_HOUR,
+        )
+        if not allowed:
+            st.warning(rate_limit_message)
+            return
+
         is_valid, validation_message = validate_feedback_text(feedback_text)
         if not is_valid:
             st.warning(validation_message)
@@ -391,7 +482,7 @@ def render_feedback_section() -> None:
         ok, message = append_feedback_to_google_sheet(feedback_text)
         if ok:
             session_id = get_or_create_session_id()
-            append_traffic_to_google_sheet("feedback_submitted", session_id, "feedback_form")
+            enqueue_traffic_event("feedback_submitted", session_id, "feedback_form")
             st.session_state["feedback_submitted_toast"] = "Feedback submitted successfully."
             st.session_state["feedback_nonce"] += 1
             st.rerun()
@@ -407,7 +498,7 @@ def main() -> None:
     session_id = get_or_create_session_id()
     active_count, total_visits = register_runtime_traffic(session_id)
     if not st.session_state.get("visit_logged"):
-        append_traffic_to_google_sheet("app_visit", session_id, "home_loaded")
+        enqueue_traffic_event("app_visit", session_id, "home_loaded")
         st.session_state["visit_logged"] = True
 
     st.title("Passport Photo Formatter")
@@ -427,6 +518,19 @@ def main() -> None:
     )
 
     if uploaded_file:
+        upload_signature = f"{uploaded_file.name}:{getattr(uploaded_file, 'size', 0)}"
+        if st.session_state.get("last_upload_rate_limit_signature") != upload_signature:
+            allowed, rate_limit_message = enforce_session_rate_limit(
+                action="photo_upload",
+                cooldown_seconds=UPLOAD_COOLDOWN_SECONDS,
+                max_actions_per_hour=MAX_UPLOADS_PER_SESSION_PER_HOUR,
+            )
+            if not allowed:
+                st.error(rate_limit_message)
+                render_feedback_section()
+                return
+            st.session_state["last_upload_rate_limit_signature"] = upload_signature
+
         is_valid, validation_message = validate_uploaded_file(uploaded_file)
         if not is_valid:
             st.error(validation_message)
@@ -436,10 +540,9 @@ def main() -> None:
         source_image = normalize_uploaded_image(uploaded_file)
         result_image, face_found, background_refined = build_passport_photo(source_image)
         encoded_bytes, quality = encode_under_limit(result_image)
-        upload_signature = f"{uploaded_file.name}:{getattr(uploaded_file, 'size', 0)}"
         if st.session_state.get("last_tracked_upload") != upload_signature:
             details = f"face_found={face_found},background_refined={background_refined}"
-            append_traffic_to_google_sheet("photo_processed", session_id, details)
+            enqueue_traffic_event("photo_processed", session_id, details)
             st.session_state["last_tracked_upload"] = upload_signature
 
         col1, col2 = st.columns(2)
