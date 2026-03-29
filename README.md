@@ -1,6 +1,6 @@
 # Passport Photo Formatter
 
-This Streamlit app accepts a JPEG portrait and converts it into a passport-style image with:
+This Streamlit app accepts a JPG/JPEG/PNG portrait and converts it into a passport-style image with:
 
 - `630 x 810` pixels
 - JPEG output under `250 KB`
