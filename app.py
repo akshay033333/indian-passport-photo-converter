@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import json
+import time
+import uuid
 from datetime import datetime, timezone
 from dataclasses import dataclass
 
@@ -16,6 +18,12 @@ from streamlit.errors import StreamlitSecretNotFoundError
 OUTPUT_WIDTH = 630
 OUTPUT_HEIGHT = 810
 MAX_FILE_SIZE_BYTES = 250 * 1024
+MAX_UPLOAD_SIZE_BYTES = 350 * 1024 * 1024
+MIN_UPLOAD_WIDTH = 300
+MIN_UPLOAD_HEIGHT = 300
+MIN_FEEDBACK_CHARS = 10
+MAX_FEEDBACK_CHARS = 1000
+SESSION_ACTIVE_WINDOW_SECONDS = 5 * 60
 
 
 @dataclass
@@ -190,6 +198,7 @@ def encode_under_limit(image: Image.Image, size_limit: int = MAX_FILE_SIZE_BYTES
 
 
 def normalize_uploaded_image(uploaded_file: io.BytesIO) -> Image.Image:
+    uploaded_file.seek(0)
     image = Image.open(uploaded_file)
     if image.mode in ("RGBA", "LA") or (image.mode == "P" and "transparency" in image.info):
         rgba_image = image.convert("RGBA")
@@ -214,6 +223,114 @@ def safe_get_secret(key: str, default: str | None = None) -> str | None:
         return st.secrets.get(key, default)
     except StreamlitSecretNotFoundError:
         return default
+
+
+@st.cache_resource(show_spinner=False)
+def get_runtime_traffic_state() -> dict[str, dict]:
+    return {"sessions_last_seen": {}, "visited_sessions": {}}
+
+
+def get_or_create_session_id() -> str:
+    if "session_id" not in st.session_state:
+        st.session_state["session_id"] = str(uuid.uuid4())
+    return st.session_state["session_id"]
+
+
+def register_runtime_traffic(session_id: str) -> tuple[int, int]:
+    state = get_runtime_traffic_state()
+    now_ts = time.time()
+    state["sessions_last_seen"][session_id] = now_ts
+    state["visited_sessions"][session_id] = True
+
+    stale_sessions = [
+        sid
+        for sid, last_seen in state["sessions_last_seen"].items()
+        if now_ts - last_seen > SESSION_ACTIVE_WINDOW_SECONDS
+    ]
+    for sid in stale_sessions:
+        state["sessions_last_seen"].pop(sid, None)
+
+    active_count = len(state["sessions_last_seen"])
+    total_visits = len(state["visited_sessions"])
+    return active_count, total_visits
+
+
+def append_traffic_to_google_sheet(event_name: str, session_id: str, details: str = "") -> tuple[bool, str]:
+    service_account_secret = safe_get_secret("GOOGLE_SERVICE_ACCOUNT_JSON")
+    sheet_id = safe_get_secret("GOOGLE_SHEET_ID")
+    worksheet_name = safe_get_secret("GOOGLE_TRAFFIC_WORKSHEET", "traffic")
+
+    if not service_account_secret or not sheet_id:
+        return (
+            False,
+            "Traffic storage is not configured. Please set GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_SHEET_ID.",
+        )
+
+    try:
+        if isinstance(service_account_secret, str):
+            service_account_info = json.loads(service_account_secret)
+        else:
+            service_account_info = dict(service_account_secret)
+
+        client = get_google_sheet_client(service_account_info)
+        spreadsheet = client.open_by_key(sheet_id)
+
+        try:
+            worksheet = spreadsheet.worksheet(worksheet_name)
+        except gspread.WorksheetNotFound:
+            worksheet = spreadsheet.add_worksheet(title=worksheet_name, rows=2000, cols=4)
+
+        first_row = worksheet.row_values(1)
+        if not first_row:
+            worksheet.append_row(
+                ["submitted_at_utc", "session_id", "event_name", "details"],
+                value_input_option="RAW",
+            )
+
+        worksheet.append_row(
+            [datetime.now(timezone.utc).isoformat(), session_id, event_name, details],
+            value_input_option="RAW",
+        )
+        return True, "Traffic event saved."
+    except Exception as exc:
+        return False, f"Could not save traffic event: {exc}"
+
+
+def validate_uploaded_file(uploaded_file: io.BytesIO) -> tuple[bool, str]:
+    allowed_mime_types = {"image/jpeg", "image/jpg", "image/png"}
+    file_size = getattr(uploaded_file, "size", None)
+    if file_size is None:
+        file_size = len(uploaded_file.getbuffer())
+
+    if file_size > MAX_UPLOAD_SIZE_BYTES:
+        return False, "Image size must be under 350 MB."
+
+    mime_type = getattr(uploaded_file, "type", "")
+    if mime_type and mime_type not in allowed_mime_types:
+        return False, "Only JPG, JPEG, and PNG files are allowed."
+
+    try:
+        uploaded_file.seek(0)
+        with Image.open(uploaded_file) as image:
+            width, height = image.size
+    except Exception:
+        return False, "Uploaded file is not a valid image."
+    finally:
+        uploaded_file.seek(0)
+
+    if width < MIN_UPLOAD_WIDTH or height < MIN_UPLOAD_HEIGHT:
+        return False, "Image resolution must be at least 300 x 300 pixels."
+
+    return True, ""
+
+
+def validate_feedback_text(feedback_text: str) -> tuple[bool, str]:
+    feedback = feedback_text.strip()
+    if len(feedback) < MIN_FEEDBACK_CHARS:
+        return False, "Feedback must be at least 10 characters."
+    if len(feedback) > MAX_FEEDBACK_CHARS:
+        return False, "Feedback must be under 1000 characters."
+    return True, ""
 
 
 def append_feedback_to_google_sheet(feedback_text: str) -> tuple[bool, str]:
@@ -266,12 +383,15 @@ def render_feedback_section() -> None:
         placeholder="Tell us what went wrong or how we can improve...",
     )
     if st.button("Submit feedback"):
-        if not feedback_text.strip():
-            st.warning("Please enter feedback before submitting.")
+        is_valid, validation_message = validate_feedback_text(feedback_text)
+        if not is_valid:
+            st.warning(validation_message)
             return
 
         ok, message = append_feedback_to_google_sheet(feedback_text)
         if ok:
+            session_id = get_or_create_session_id()
+            append_traffic_to_google_sheet("feedback_submitted", session_id, "feedback_form")
             st.session_state["feedback_submitted_toast"] = "Feedback submitted successfully."
             st.session_state["feedback_nonce"] += 1
             st.rerun()
@@ -284,6 +404,12 @@ def main() -> None:
     st.session_state.setdefault("uploader_nonce", 0)
     if "feedback_submitted_toast" in st.session_state:
         st.toast(st.session_state.pop("feedback_submitted_toast"), icon="✅")
+    session_id = get_or_create_session_id()
+    active_count, total_visits = register_runtime_traffic(session_id)
+    st.caption(f"Live active users: `{active_count}` | Visits (runtime): `{total_visits}`")
+    if not st.session_state.get("visit_logged"):
+        append_traffic_to_google_sheet("app_visit", session_id, "home_loaded")
+        st.session_state["visit_logged"] = True
 
     st.title("Passport Photo Formatter")
     st.write(
@@ -302,9 +428,20 @@ def main() -> None:
     )
 
     if uploaded_file:
+        is_valid, validation_message = validate_uploaded_file(uploaded_file)
+        if not is_valid:
+            st.error(validation_message)
+            render_feedback_section()
+            return
+
         source_image = normalize_uploaded_image(uploaded_file)
         result_image, face_found, background_refined = build_passport_photo(source_image)
         encoded_bytes, quality = encode_under_limit(result_image)
+        upload_signature = f"{uploaded_file.name}:{getattr(uploaded_file, 'size', 0)}"
+        if st.session_state.get("last_tracked_upload") != upload_signature:
+            details = f"face_found={face_found},background_refined={background_refined}"
+            append_traffic_to_google_sheet("photo_processed", session_id, details)
+            st.session_state["last_tracked_upload"] = upload_signature
 
         col1, col2 = st.columns(2)
         with col1:
