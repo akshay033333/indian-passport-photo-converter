@@ -15,6 +15,17 @@ import numpy as np
 import streamlit as st
 from PIL import Image
 from streamlit.errors import StreamlitSecretNotFoundError
+try:
+    from pillow_heif import register_heif_opener  # pyright: ignore[reportMissingImports]
+
+    register_heif_opener()
+except Exception:
+    pass
+
+try:
+    import psutil  # pyright: ignore[reportMissingModuleSource]
+except Exception:
+    psutil = None
 
 
 OUTPUT_WIDTH = 630
@@ -34,6 +45,8 @@ UPLOAD_COOLDOWN_SECONDS = 2
 FEEDBACK_COOLDOWN_SECONDS = 10
 MAX_UPLOADS_PER_SESSION_PER_HOUR = 120
 MAX_FEEDBACK_PER_SESSION_PER_HOUR = 30
+CACHE_TTL_SECONDS = 1800
+CACHE_MAX_IMAGE_ENTRIES = 16
 
 
 @dataclass
@@ -207,15 +220,26 @@ def encode_under_limit(image: Image.Image, size_limit: int = MAX_FILE_SIZE_BYTES
     return buffer.getvalue(), 25
 
 
-def normalize_uploaded_image(uploaded_file: io.BytesIO) -> Image.Image:
-    uploaded_file.seek(0)
-    image = Image.open(uploaded_file)
+def normalize_uploaded_image_bytes(file_bytes: bytes) -> Image.Image:
+    image = Image.open(io.BytesIO(file_bytes))
     if image.mode in ("RGBA", "LA") or (image.mode == "P" and "transparency" in image.info):
         rgba_image = image.convert("RGBA")
         white_bg = Image.new("RGBA", rgba_image.size, (255, 255, 255, 255))
         return Image.alpha_composite(white_bg, rgba_image).convert("RGB")
 
     return image.convert("RGB")
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_IMAGE_ENTRIES)
+def process_passport_from_bytes(
+    file_bytes: bytes,
+) -> tuple[bytes, int, bool, bool, bytes]:
+    source_image = normalize_uploaded_image_bytes(file_bytes)
+    result_image, face_found, background_refined = build_passport_photo(source_image)
+    encoded_bytes, quality = encode_under_limit(result_image)
+    preview_buffer = io.BytesIO()
+    result_image.save(preview_buffer, format="JPEG", quality=88, optimize=True)
+    return encoded_bytes, quality, face_found, background_refined, preview_buffer.getvalue()
 
 
 def clear_photo_session() -> None:
@@ -355,32 +379,31 @@ def enqueue_traffic_event(event_name: str, session_id: str, details: str = "") -
     executor.submit(_run)
 
 
-def validate_uploaded_file(uploaded_file: io.BytesIO) -> tuple[bool, str]:
-    allowed_mime_types = {"image/jpeg", "image/jpg", "image/png"}
-    allowed_pil_formats = {"JPEG", "PNG"}
-    file_size = getattr(uploaded_file, "size", None)
-    if file_size is None:
-        file_size = len(uploaded_file.getbuffer())
+def validate_uploaded_file_bytes(file_bytes: bytes, mime_type: str = "") -> tuple[bool, str]:
+    allowed_mime_types = {"image/jpeg", "image/jpg", "image/png", "image/heic", "image/heif"}
+    allowed_pil_formats = {"JPEG", "PNG", "HEIF"}
+    file_size = len(file_bytes)
 
     if file_size > MAX_UPLOAD_SIZE_BYTES:
         return False, "Image size must be under 350 MB."
 
-    mime_type = getattr(uploaded_file, "type", "")
-    if mime_type and mime_type not in allowed_mime_types:
-        return False, "Only JPG, JPEG, and PNG files are allowed."
+    # MIME can be unreliable (e.g. application/octet-stream), so we validate
+    # actual content/format with Pillow before enforcing allowed image formats.
 
     try:
-        uploaded_file.seek(0)
-        with Image.open(uploaded_file) as image:
+        # First pass: verify the uploaded bytes are a valid image payload.
+        with Image.open(io.BytesIO(file_bytes)) as image:
+            image.verify()
+
+        # Second pass: reopen to safely read metadata/dimensions after verify().
+        with Image.open(io.BytesIO(file_bytes)) as image:
             width, height = image.size
             image_format = (image.format or "").upper()
     except Exception:
         return False, "Uploaded file is not a valid image."
-    finally:
-        uploaded_file.seek(0)
 
     if image_format not in allowed_pil_formats:
-        return False, "Only JPG, JPEG, and PNG files are allowed."
+        return False, "Only JPG, JPEG, PNG, HEIC, and HEIF files are allowed."
 
     if width < MIN_UPLOAD_WIDTH or height < MIN_UPLOAD_HEIGHT:
         return False, "Image resolution must be at least 300 x 300 pixels."
@@ -453,6 +476,16 @@ def append_feedback_to_google_sheet(feedback_text: str) -> tuple[bool, str]:
         return False, "Could not submit feedback right now. Please try again later."
 
 
+def get_process_memory_mb() -> float | None:
+    if psutil is None:
+        return None
+    try:
+        process = psutil.Process()
+        return float(process.memory_info().rss) / (1024 * 1024)
+    except Exception:
+        return None
+
+
 def render_feedback_section() -> None:
     st.divider()
     st.subheader("Feedback")
@@ -503,12 +536,12 @@ def main() -> None:
 
     st.title("Passport Photo Formatter")
     st.write(
-        "Upload a JPG, JPEG, or PNG portrait and export a `630 x 810` image with a white background, "
+        "Upload a JPG, JPEG, PNG, HEIC, or HEIF portrait and export a `630 x 810` image with a white background, "
         "tight head-and-shoulders framing, and a JPEG size target under `250 KB`."
     )
     uploaded_file = st.file_uploader(
-        "Upload a JPG, JPEG, or PNG image",
-        type=["jpg", "jpeg", "png"],
+        "Upload a JPG, JPEG, PNG, HEIC, or HEIF image",
+        type=["jpg", "jpeg", "png", "heic", "heif"],
         key=f"passport_uploader_{st.session_state['uploader_nonce']}",
     )
 
@@ -518,7 +551,8 @@ def main() -> None:
     )
 
     if uploaded_file:
-        upload_signature = f"{uploaded_file.name}:{getattr(uploaded_file, 'size', 0)}"
+        file_bytes = uploaded_file.getvalue()
+        upload_signature = f"{uploaded_file.name}:{len(file_bytes)}"
         if st.session_state.get("last_upload_rate_limit_signature") != upload_signature:
             allowed, rate_limit_message = enforce_session_rate_limit(
                 action="photo_upload",
@@ -531,15 +565,19 @@ def main() -> None:
                 return
             st.session_state["last_upload_rate_limit_signature"] = upload_signature
 
-        is_valid, validation_message = validate_uploaded_file(uploaded_file)
+        is_valid, validation_message = validate_uploaded_file_bytes(file_bytes, getattr(uploaded_file, "type", ""))
         if not is_valid:
             st.error(validation_message)
             render_feedback_section()
             return
 
-        source_image = normalize_uploaded_image(uploaded_file)
-        result_image, face_found, background_refined = build_passport_photo(source_image)
-        encoded_bytes, quality = encode_under_limit(result_image)
+        (
+            encoded_bytes,
+            quality,
+            face_found,
+            background_refined,
+            result_preview_bytes,
+        ) = process_passport_from_bytes(file_bytes)
         if st.session_state.get("last_tracked_upload") != upload_signature:
             details = f"face_found={face_found},background_refined={background_refined}"
             enqueue_traffic_event("photo_processed", session_id, details)
@@ -548,11 +586,11 @@ def main() -> None:
         col1, col2 = st.columns(2)
         with col1:
             st.subheader("Original")
-            st.image(source_image, use_container_width=True)
+            st.image(file_bytes, use_container_width=True)
 
         with col2:
             st.subheader("Formatted")
-            st.image(result_image, use_container_width=True)
+            st.image(result_preview_bytes, use_container_width=True)
 
         st.success(
             f"Export ready: `630x810 px`, `{len(encoded_bytes) / 1024:.1f} KB`, JPEG quality `{quality}`."
@@ -588,7 +626,15 @@ def main() -> None:
                 clear_photo_session()
 
     render_feedback_section()
-    st.caption(f"Live active users: `{active_count}` | Visits (runtime): `{total_visits}`")
+    memory_mb = get_process_memory_mb()
+    if memory_mb is None:
+        st.caption(f"Live active users: `{active_count}` | Visits (runtime): `{total_visits}`")
+    else:
+        estimated_mb_per_active_session = memory_mb / max(active_count, 1)
+        st.caption(
+            f"Live active users: `{active_count}` | Visits (runtime): `{total_visits}` | "
+            f"RAM: `{memory_mb:.1f} MB` | Est/session: `{estimated_mb_per_active_session:.1f} MB`"
+        )
 
 
 if __name__ == "__main__":
