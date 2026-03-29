@@ -61,11 +61,6 @@ https://github.com/your-user/passport-photo-app.git
 git@github.com:your-user/passport-photo-app.git
 ```
 
-If you want the branch to be `main` instead of `codex/passport-photo-app`, run:
-
-```bash
-git branch -M main
-git push -u origin main
 ```
 
 ## Notes
