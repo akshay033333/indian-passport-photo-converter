@@ -6,8 +6,8 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import cv2
 import gspread
@@ -15,629 +15,639 @@ import numpy as np
 import streamlit as st
 from PIL import Image
 from streamlit.errors import StreamlitSecretNotFoundError
-try:
-    import psutil  # pyright: ignore[reportMissingModuleSource]
-except Exception:
-    psutil = None
+
+# -- Output spec --
+OUTPUT_W = 630
+OUTPUT_H = 810
+OUTPUT_ASPECT = OUTPUT_W / OUTPUT_H
+MAX_OUTPUT_BYTES = 250 * 1024
+
+# -- Upload validation --
+MAX_UPLOAD_BYTES = 350 * 1024 * 1024
+MIN_DIM = 300
+MAX_PIXELS = 40_000_000
+MAX_ASPECT = 2.0
+MIN_ASPECT = 0.4
+MIN_FACE_AREA = 0.02
+ALLOWED_FORMATS = {"JPEG", "PNG"}
+
+# -- Crop geometry (Indian passport: face ≈ 36 % of frame height) --
+FACE_H_RATIO = 0.36
+HEAD_TOP_OFFSET = 0.30
+
+# -- Rate limits --
+UPLOAD_COOLDOWN = 2
+FEEDBACK_COOLDOWN = 10
+MAX_UPLOADS_HR = 120
+MAX_FEEDBACK_HR = 30
+
+# -- Cache --
+CACHE_TTL = 1800
+CACHE_MAX = 16
+
+# -- Google Sheets analytics --
+SESSION_WINDOW = 300
+SHEET_RETRIES = 3
+SHEET_RETRY_DELAY = 0.4
+BG_QUEUE_LIMIT = 200
+
+# -- Feedback --
+FB_MIN_CHARS = 10
+FB_MAX_CHARS = 1000
+
+# -- Custom CSS --
+_GREEN_BTN_CSS = """<style>
+div[data-testid="stDownloadButton"]>button{background:#22c55e;color:#fff;border:0;font-weight:600}
+div[data-testid="stDownloadButton"]>button:hover{background:#16a34a;color:#fff;border:0}
+div[data-testid="stDownloadButton"]>button:active{background:#15803d;color:#fff}
+</style>"""
 
 
-OUTPUT_WIDTH = 630
-OUTPUT_HEIGHT = 810
-MAX_FILE_SIZE_BYTES = 250 * 1024
-MAX_UPLOAD_SIZE_BYTES = 350 * 1024 * 1024
-MIN_UPLOAD_WIDTH = 300
-MIN_UPLOAD_HEIGHT = 300
-MAX_UPLOAD_PIXELS = 40_000_000
-MIN_FEEDBACK_CHARS = 10
-MAX_FEEDBACK_CHARS = 1000
-SESSION_ACTIVE_WINDOW_SECONDS = 5 * 60
-MAX_BACKGROUND_LOG_QUEUE = 200
-MAX_SHEET_WRITE_RETRIES = 3
-SHEET_RETRY_BASE_DELAY_SECONDS = 0.4
-UPLOAD_COOLDOWN_SECONDS = 2
-FEEDBACK_COOLDOWN_SECONDS = 10
-MAX_UPLOADS_PER_SESSION_PER_HOUR = 120
-MAX_FEEDBACK_PER_SESSION_PER_HOUR = 30
-CACHE_TTL_SECONDS = 1800
-CACHE_MAX_IMAGE_ENTRIES = 16
+# =========================================================================
+# Image processing
+# =========================================================================
 
-
-@dataclass
+@dataclass(frozen=True, slots=True)
 class FaceBox:
-    x: int
-    y: int
-    w: int
-    h: int
+    x: int; y: int; w: int; h: int
 
 
-def pil_to_bgr(image: Image.Image) -> np.ndarray:
-    rgb = np.array(image.convert("RGB"))
-    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+def _pil_to_bgr(img: Image.Image) -> np.ndarray:
+    return cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2BGR)
 
 
-def bgr_to_pil(image: np.ndarray) -> Image.Image:
-    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(rgb)
+def _bgr_to_pil(arr: np.ndarray) -> Image.Image:
+    return Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
 
 
-def detect_primary_face(image_bgr: np.ndarray) -> FaceBox | None:
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    face_cascade = cv2.CascadeClassifier(cascade_path)
-    faces = face_cascade.detectMultiScale(
-        gray,
-        scaleFactor=1.1,
-        minNeighbors=5,
-        minSize=(80, 80),
-    )
-
-    if len(faces) == 0:
-        return None
-
-    x, y, w, h = max(faces, key=lambda box: box[2] * box[3])
-    return FaceBox(int(x), int(y), int(w), int(h))
+def _detect_faces(bgr: np.ndarray) -> list[FaceBox]:
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    rects = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80))
+    if len(rects) == 0:
+        return []
+    return [FaceBox(int(x), int(y), int(w), int(h)) for x, y, w, h in rects]
 
 
-def clamp(value: float, minimum: float, maximum: float) -> float:
-    return max(minimum, min(value, maximum))
+def _largest_face(bgr: np.ndarray) -> FaceBox | None:
+    faces = _detect_faces(bgr)
+    return max(faces, key=lambda f: f.w * f.h) if faces else None
 
 
-def compute_crop_box(image_w: int, image_h: int, face: FaceBox) -> tuple[int, int, int, int]:
-    target_aspect = OUTPUT_WIDTH / OUTPUT_HEIGHT
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(v, hi))
 
-    crop_h = face.h / 0.52
-    crop_w = crop_h * target_aspect
 
-    crop_h = max(crop_h, face.h * 1.75)
-    crop_w = max(crop_w, face.w * 1.55)
+def _crop_around_face(img_w: int, img_h: int, f: FaceBox) -> tuple[int, int, int, int]:
+    ch = f.h / FACE_H_RATIO
+    cw = ch * OUTPUT_ASPECT
 
-    if crop_w / crop_h < target_aspect:
-        crop_w = crop_h * target_aspect
+    ch = max(ch, f.h * 2.5)
+    cw = max(cw, f.w * 2.0)
+
+    # Enforce output aspect ratio after initial sizing
+    if cw / ch < OUTPUT_ASPECT:
+        cw = ch * OUTPUT_ASPECT
     else:
-        crop_h = crop_w / target_aspect
+        ch = cw / OUTPUT_ASPECT
 
-    center_x = face.x + face.w / 2
-    center_y = face.y + face.h * 0.60
+    # Clamp to image bounds, then re-enforce aspect ratio
+    cw, ch = min(cw, float(img_w)), min(ch, float(img_h))
+    if cw / ch < OUTPUT_ASPECT:
+        cw = ch * OUTPUT_ASPECT
+    else:
+        ch = cw / OUTPUT_ASPECT
 
-    left = center_x - crop_w / 2
-    top = center_y - crop_h * 0.43
-
-    left = clamp(left, 0, image_w - crop_w)
-    top = clamp(top, 0, image_h - crop_h)
-
-    right = left + crop_w
-    bottom = top + crop_h
-
-    return int(round(left)), int(round(top)), int(round(right)), int(round(bottom))
+    left = _clamp((f.x + f.w / 2) - cw / 2, 0, img_w - cw)
+    top = _clamp(f.y - ch * HEAD_TOP_OFFSET, 0, img_h - ch)
+    return int(round(left)), int(round(top)), int(round(left + cw)), int(round(top + ch))
 
 
-def whiten_background(image_bgr: np.ndarray, face_hint: FaceBox | None = None) -> tuple[np.ndarray, bool]:
-    h, w = image_bgr.shape[:2]
+def _center_crop(bgr: np.ndarray) -> np.ndarray:
+    h, w = bgr.shape[:2]
+    if w / h > OUTPUT_ASPECT:
+        nw = int(h * OUTPUT_ASPECT)
+        s = (w - nw) // 2
+        return bgr[:, s:s + nw]
+    nh = int(w / OUTPUT_ASPECT)
+    s = (h - nh) // 2
+    return bgr[s:s + nh, :]
+
+
+def _whiten_bg(bgr: np.ndarray, face: FaceBox | None) -> tuple[np.ndarray, bool]:
+    h, w = bgr.shape[:2]
     mask = np.full((h, w), cv2.GC_PR_BGD, np.uint8)
-    bg_model = np.zeros((1, 65), np.float64)
-    fg_model = np.zeros((1, 65), np.float64)
+    bg_mdl = np.zeros((1, 65), np.float64)
+    fg_mdl = np.zeros((1, 65), np.float64)
 
-    border_x = max(8, int(w * 0.03))
-    border_y = max(8, int(h * 0.03))
-    mask[:border_y, :] = cv2.GC_BGD
-    mask[-border_y:, :] = cv2.GC_BGD
-    mask[:, :border_x] = cv2.GC_BGD
-    mask[:, -border_x:] = cv2.GC_BGD
+    bx, by = max(8, int(w * 0.03)), max(8, int(h * 0.03))
+    mask[:by, :] = cv2.GC_BGD
+    mask[-by:, :] = cv2.GC_BGD
+    mask[:, :bx] = cv2.GC_BGD
+    mask[:, -bx:] = cv2.GC_BGD
 
-    center_margin_x = max(20, int(w * 0.18))
-    center_margin_y = max(20, int(h * 0.12))
-    mask[
-        center_margin_y:h - center_margin_y,
-        center_margin_x:w - center_margin_x,
-    ] = cv2.GC_PR_FGD
+    mx, my = max(20, int(w * 0.18)), max(20, int(h * 0.12))
+    mask[my:h - my, mx:w - mx] = cv2.GC_PR_FGD
 
-    if face_hint is not None:
-        left = int(clamp(face_hint.x - face_hint.w * 0.9, 0, w - 1))
-        top = int(clamp(face_hint.y - face_hint.h * 1.2, 0, h - 1))
-        right = int(clamp(face_hint.x + face_hint.w * 1.9, 1, w))
-        bottom = int(clamp(face_hint.y + face_hint.h * 3.2, 1, h))
-        if right > left and bottom > top:
-            mask[top:bottom, left:right] = cv2.GC_FGD
+    if face is not None:
+        fl = int(_clamp(face.x - face.w * 0.9, 0, w - 1))
+        ft = int(_clamp(face.y - face.h * 1.2, 0, h - 1))
+        fr = int(_clamp(face.x + face.w * 1.9, 1, w))
+        fb = int(_clamp(face.y + face.h * 3.2, 1, h))
+        if fr > fl and fb > ft:
+            mask[ft:fb, fl:fr] = cv2.GC_FGD
 
     try:
-        cv2.grabCut(image_bgr, mask, None, bg_model, fg_model, 5, cv2.GC_INIT_WITH_MASK)
-        foreground = np.where((mask == 1) | (mask == 3), 255, 0).astype(np.uint8)
+        cv2.grabCut(bgr, mask, None, bg_mdl, fg_mdl, 5, cv2.GC_INIT_WITH_MASK)
+        fg = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
     except cv2.error:
-        foreground = np.full((h, w), 255, dtype=np.uint8)
+        fg = np.full((h, w), 255, np.uint8)
 
-    kernel = np.ones((5, 5), np.uint8)
-    foreground = cv2.morphologyEx(foreground, cv2.MORPH_CLOSE, kernel, iterations=1)
-    foreground = cv2.dilate(foreground, kernel, iterations=1)
-    foreground = cv2.GaussianBlur(foreground, (7, 7), 0)
+    k = np.ones((5, 5), np.uint8)
+    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, k)
+    fg = cv2.dilate(fg, k)
+    fg = cv2.GaussianBlur(fg, (7, 7), 0)
 
-    fg_ratio = float(np.count_nonzero(foreground)) / float(h * w)
-    if fg_ratio < 0.18:
-        return image_bgr, False
+    if np.count_nonzero(fg) / (h * w) < 0.18:
+        return bgr, False
 
-    alpha = foreground.astype(np.float32) / 255.0
-    alpha = alpha[..., None]
-
-    white_bg = np.full_like(image_bgr, 252)
-    blended = image_bgr.astype(np.float32) * alpha + white_bg.astype(np.float32) * (1 - alpha)
-    return blended.astype(np.uint8), True
+    a = (fg.astype(np.float32) / 255.0)[..., None]
+    white = np.full_like(bgr, 252)
+    return (bgr.astype(np.float32) * a + white.astype(np.float32) * (1 - a)).astype(np.uint8), True
 
 
-def build_passport_photo(image: Image.Image) -> tuple[Image.Image, bool, bool]:
-    image_bgr = pil_to_bgr(image)
-    face = detect_primary_face(image_bgr)
+def _build_passport(img: Image.Image) -> tuple[Image.Image, bool, bool]:
+    bgr = _pil_to_bgr(img)
+    face = _largest_face(bgr)
 
-    face_found = face is not None
-    if face_found:
-        left, top, right, bottom = compute_crop_box(image_bgr.shape[1], image_bgr.shape[0], face)
-        image_bgr = image_bgr[top:bottom, left:right]
+    if face:
+        l, t, r, b = _crop_around_face(bgr.shape[1], bgr.shape[0], face)
+        bgr = bgr[t:b, l:r]
     else:
-        image_bgr = center_crop_to_aspect(image_bgr, OUTPUT_WIDTH / OUTPUT_HEIGHT)
+        bgr = _center_crop(bgr)
 
-    face_after_crop = detect_primary_face(image_bgr)
-    image_bgr, background_refined = whiten_background(image_bgr, face_after_crop)
-    image_bgr = cv2.resize(image_bgr, (OUTPUT_WIDTH, OUTPUT_HEIGHT), interpolation=cv2.INTER_CUBIC)
-    return bgr_to_pil(image_bgr), face_found, background_refined
-
-
-def center_crop_to_aspect(image_bgr: np.ndarray, target_aspect: float) -> np.ndarray:
-    h, w = image_bgr.shape[:2]
-    current_aspect = w / h
-
-    if current_aspect > target_aspect:
-        new_w = int(h * target_aspect)
-        start_x = (w - new_w) // 2
-        return image_bgr[:, start_x:start_x + new_w]
-
-    new_h = int(w / target_aspect)
-    start_y = (h - new_h) // 2
-    return image_bgr[start_y:start_y + new_h, :]
+    bgr, bg_ok = _whiten_bg(bgr, _largest_face(bgr))
+    bgr = cv2.resize(bgr, (OUTPUT_W, OUTPUT_H), interpolation=cv2.INTER_CUBIC)
+    return _bgr_to_pil(bgr), face is not None, bg_ok
 
 
-def strip_image_metadata(image: Image.Image) -> Image.Image:
-    # Rebuild the image from raw pixels so source metadata/EXIF is not carried over.
-    pixel_data = np.array(image.convert("RGB"))
-    return Image.fromarray(pixel_data, mode="RGB")
+def _encode_jpeg(img: Image.Image, limit: int = MAX_OUTPUT_BYTES) -> tuple[bytes, int]:
+    rgb = img.convert("RGB")
+    rgb.info.clear()
+    for q in range(95, 24, -5):
+        buf = io.BytesIO()
+        rgb.save(buf, format="JPEG", quality=q, optimize=True, exif=b"")
+        if len(buf.getvalue()) <= limit:
+            return buf.getvalue(), q
+    buf = io.BytesIO()
+    rgb.save(buf, format="JPEG", quality=25, optimize=True, exif=b"")
+    return buf.getvalue(), 25
 
 
-def encode_under_limit(image: Image.Image, size_limit: int = MAX_FILE_SIZE_BYTES) -> tuple[bytes, int]:
-    clean_image = strip_image_metadata(image)
-    for quality in range(95, 29, -5):
-        buffer = io.BytesIO()
-        clean_image.save(buffer, format="JPEG", quality=quality, optimize=True, exif=b"")
-        data = buffer.getvalue()
-        if len(data) <= size_limit:
-            return data, quality
-
-    buffer = io.BytesIO()
-    clean_image.save(buffer, format="JPEG", quality=25, optimize=True, exif=b"")
-    return buffer.getvalue(), 25
+def _normalize(raw: bytes) -> Image.Image:
+    img = Image.open(io.BytesIO(raw))
+    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+        return Image.alpha_composite(bg, img.convert("RGBA")).convert("RGB")
+    return img.convert("RGB")
 
 
-def normalize_uploaded_image_bytes(file_bytes: bytes) -> Image.Image:
-    image = Image.open(io.BytesIO(file_bytes))
-    if image.mode in ("RGBA", "LA") or (image.mode == "P" and "transparency" in image.info):
-        rgba_image = image.convert("RGBA")
-        white_bg = Image.new("RGBA", rgba_image.size, (255, 255, 255, 255))
-        return Image.alpha_composite(white_bg, rgba_image).convert("RGB")
-
-    return image.convert("RGB")
-
-
-@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_IMAGE_ENTRIES)
-def process_passport_from_bytes(
-    file_bytes: bytes,
-) -> tuple[bytes, int, bool, bool, bytes]:
-    source_image = normalize_uploaded_image_bytes(file_bytes)
-    result_image, face_found, background_refined = build_passport_photo(source_image)
-    encoded_bytes, quality = encode_under_limit(result_image)
-    preview_buffer = io.BytesIO()
-    result_image.save(preview_buffer, format="JPEG", quality=88, optimize=True)
-    return encoded_bytes, quality, face_found, background_refined, preview_buffer.getvalue()
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL, max_entries=CACHE_MAX)
+def _process(raw: bytes) -> tuple[bytes, int, bool, bool, bytes]:
+    result, face_ok, bg_ok = _build_passport(_normalize(raw))
+    encoded, quality = _encode_jpeg(result)
+    buf = io.BytesIO()
+    result.save(buf, format="JPEG", quality=88, optimize=True)
+    return encoded, quality, face_ok, bg_ok, buf.getvalue()
 
 
-def clear_photo_session() -> None:
-    st.session_state["uploader_nonce"] = st.session_state.get("uploader_nonce", 0) + 1
-    st.rerun()
+def _adjust(img: Image.Image, br: int, ct: int, zoom: int, bg_pct: int) -> Image.Image:
+    arr = np.array(img, dtype=np.float32)
+    if br:
+        arr = np.clip(arr + br, 0, 255)
+    if ct:
+        f = (100 + ct) / 100.0
+        arr = np.clip(128 + f * (arr - 128), 0, 255)
+    out = Image.fromarray(arr.astype(np.uint8))
+
+    if zoom != 100:
+        w, h = out.size
+        s = zoom / 100.0
+        nw, nh = int(w * s), int(h * s)
+        r = out.resize((nw, nh), Image.LANCZOS)
+        lx, ly = (nw - w) // 2, (nh - h) // 2
+        out = r.crop((lx, ly, lx + w, ly + h))
+
+    if bg_pct < 100:
+        a = np.array(out, dtype=np.float32)
+        m = np.all(a > 240, axis=2)
+        b = bg_pct / 100.0
+        a[m] = a[m] * b + 252 * (1 - b)
+        out = Image.fromarray(a.astype(np.uint8))
+
+    return out
 
 
-@st.cache_resource(show_spinner=False)
-def get_google_sheet_client(service_account_info: dict) -> gspread.Client:
-    return gspread.service_account_from_dict(service_account_info)
+# =========================================================================
+# Validation
+# =========================================================================
+
+def _validate(raw: bytes) -> tuple[bool, str]:
+    if len(raw) > MAX_UPLOAD_BYTES:
+        return False, "Image must be under 350 MB."
+
+    try:
+        with Image.open(io.BytesIO(raw)) as img:
+            img.verify()
+    except Exception:
+        return False, "Uploaded file is not a valid image."
+
+    # Reopen after verify() (which consumes the stream)
+    img = Image.open(io.BytesIO(raw))
+    w, h = img.size
+    fmt = (img.format or "").upper()
+
+    if fmt not in ALLOWED_FORMATS:
+        return False, "Only JPG, JPEG, and PNG files are allowed."
+    if w < MIN_DIM or h < MIN_DIM:
+        return False, f"Image must be at least {MIN_DIM} x {MIN_DIM} pixels."
+    if w * h > MAX_PIXELS:
+        return False, "Resolution too high. Please upload up to 40 megapixels."
+
+    aspect = w / h
+    if aspect > MAX_ASPECT:
+        return False, "Landscape/panoramic images are not supported. Upload a portrait photo."
+    if aspect < MIN_ASPECT:
+        return False, "Image is too narrow. Upload a standard portrait photo."
+
+    try:
+        bgr = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2BGR)
+        faces = _detect_faces(bgr)
+        if not faces:
+            return False, (
+                "No face detected. Upload a clear, front-facing portrait "
+                "with good lighting and no obstructions."
+            )
+        if len(faces) > 1:
+            return False, (
+                f"Multiple faces detected ({len(faces)}). "
+                "Passport photos must contain exactly one person."
+            )
+        f = faces[0]
+        if (f.w * f.h) / (w * h) < MIN_FACE_AREA:
+            return False, "Face is too small. Move closer so your face fills the frame."
+    except Exception:
+        pass
+
+    return True, ""
 
 
-def safe_get_secret(key: str, default: str | None = None) -> str | None:
+def _validate_fb(text: str) -> tuple[bool, str]:
+    t = text.strip()
+    if len(t) < FB_MIN_CHARS:
+        return False, f"Feedback must be at least {FB_MIN_CHARS} characters."
+    if len(t) > FB_MAX_CHARS:
+        return False, f"Feedback must be under {FB_MAX_CHARS} characters."
+    return True, ""
+
+
+# =========================================================================
+# Rate limiting
+# =========================================================================
+
+def _rate_ok(action: str, cooldown: int, max_hr: int) -> tuple[bool, str]:
+    now = time.time()
+    st_ = st.session_state.setdefault(f"rl_{action}", {"ts": 0.0, "ev": []})
+    st_["ev"] = [t for t in st_["ev"] if now - t < 3600]
+
+    gap = now - float(st_["ts"])
+    if gap < cooldown:
+        return False, f"Please wait {int(cooldown - gap) + 1}s before trying again."
+    if len(st_["ev"]) >= max_hr:
+        return False, "Rate limit reached. Please try again later."
+
+    st_["ts"] = now
+    st_["ev"].append(now)
+    return True, ""
+
+
+# =========================================================================
+# Google Sheets helpers
+# =========================================================================
+
+def _secret(key: str, default: str | None = None) -> str | None:
     try:
         return st.secrets.get(key, default)
     except StreamlitSecretNotFoundError:
         return default
 
 
-@st.cache_resource(show_spinner=False)
-def get_runtime_traffic_state() -> dict[str, dict]:
-    return {
-        "sessions_last_seen": {},
-        "visited_sessions": {},
-        "lock": threading.Lock(),
-    }
-
-
-@st.cache_resource(show_spinner=False)
-def get_background_log_executor() -> ThreadPoolExecutor:
-    return ThreadPoolExecutor(max_workers=4, thread_name_prefix="traffic-logger")
-
-
-@st.cache_resource(show_spinner=False)
-def get_background_log_semaphore() -> threading.BoundedSemaphore:
-    return threading.BoundedSemaphore(MAX_BACKGROUND_LOG_QUEUE)
-
-
-def get_or_create_session_id() -> str:
-    if "session_id" not in st.session_state:
-        st.session_state["session_id"] = str(uuid.uuid4())
-    return st.session_state["session_id"]
-
-
-def register_runtime_traffic(session_id: str) -> tuple[int, int]:
-    state = get_runtime_traffic_state()
-    now_ts = time.time()
-    with state["lock"]:
-        state["sessions_last_seen"][session_id] = now_ts
-        state["visited_sessions"][session_id] = True
-
-        stale_sessions = [
-            sid
-            for sid, last_seen in state["sessions_last_seen"].items()
-            if now_ts - last_seen > SESSION_ACTIVE_WINDOW_SECONDS
-        ]
-        for sid in stale_sessions:
-            state["sessions_last_seen"].pop(sid, None)
-
-        active_count = len(state["sessions_last_seen"])
-        total_visits = len(state["visited_sessions"])
-    return active_count, total_visits
-
-
-def get_service_account_info() -> tuple[dict | None, str | None]:
-    service_account_secret = safe_get_secret("GOOGLE_SERVICE_ACCOUNT_JSON")
-    sheet_id = safe_get_secret("GOOGLE_SHEET_ID")
-    if not service_account_secret or not sheet_id:
+def _service_account() -> tuple[dict | None, str | None]:
+    raw = _secret("GOOGLE_SERVICE_ACCOUNT_JSON")
+    sid = _secret("GOOGLE_SHEET_ID")
+    if not raw or not sid:
         return None, None
-
-    if isinstance(service_account_secret, str):
-        return json.loads(service_account_secret), sheet_id
-    return dict(service_account_secret), sheet_id
+    return (json.loads(raw) if isinstance(raw, str) else dict(raw)), sid
 
 
-def append_row_with_retries(worksheet: gspread.Worksheet, row: list[str]) -> None:
-    for attempt in range(MAX_SHEET_WRITE_RETRIES):
+@st.cache_resource(show_spinner=False)
+def _gsheet_client(info: dict) -> gspread.Client:
+    return gspread.service_account_from_dict(info)
+
+
+def _append_retry(ws: gspread.Worksheet, row: list[str]) -> None:
+    for i in range(SHEET_RETRIES):
         try:
-            worksheet.append_row(row, value_input_option="RAW")
+            ws.append_row(row, value_input_option="RAW")
             return
         except Exception:
-            if attempt == MAX_SHEET_WRITE_RETRIES - 1:
+            if i == SHEET_RETRIES - 1:
                 raise
-            time.sleep(SHEET_RETRY_BASE_DELAY_SECONDS * (2**attempt))
+            time.sleep(SHEET_RETRY_DELAY * (2 ** i))
 
 
-def append_traffic_to_google_sheet(event_name: str, session_id: str, details: str = "") -> tuple[bool, str]:
-    service_account_info, sheet_id = get_service_account_info()
-    worksheet_name = safe_get_secret("GOOGLE_TRAFFIC_WORKSHEET", "traffic")
-
-    if not service_account_info or not sheet_id:
-        return (
-            False,
-            "Traffic storage is not configured. Please set GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_SHEET_ID.",
-        )
-
+def _worksheet(sheet_id: str, sa: dict, name: str, header: list[str]) -> gspread.Worksheet:
+    sp = _gsheet_client(sa).open_by_key(sheet_id)
     try:
-        client = get_google_sheet_client(service_account_info)
-        spreadsheet = client.open_by_key(sheet_id)
-
-        try:
-            worksheet = spreadsheet.worksheet(worksheet_name)
-        except gspread.WorksheetNotFound:
-            worksheet = spreadsheet.add_worksheet(title=worksheet_name, rows=2000, cols=4)
-
-        first_row = worksheet.row_values(1)
-        if not first_row:
-            append_row_with_retries(
-                worksheet,
-                ["submitted_at_utc", "session_id", "event_name", "details"],
-            )
-
-        append_row_with_retries(
-            worksheet,
-            [datetime.now(timezone.utc).isoformat(), session_id, event_name, details],
-        )
-        return True, "Traffic event saved."
-    except Exception as exc:
-        print(f"Traffic write error: {exc}")
-        return False, "Could not save traffic event right now."
+        ws = sp.worksheet(name)
+    except gspread.WorksheetNotFound:
+        ws = sp.add_worksheet(title=name, rows=2000, cols=len(header))
+    if not ws.row_values(1):
+        _append_retry(ws, header)
+    return ws
 
 
-def enqueue_traffic_event(event_name: str, session_id: str, details: str = "") -> None:
-    semaphore = get_background_log_semaphore()
-    if not semaphore.acquire(blocking=False):
-        # Drop excess analytics events under burst load to protect core app UX.
+def _write_feedback(text: str) -> tuple[bool, str]:
+    sa, sid = _service_account()
+    if not sa or not sid:
+        return False, "Feedback storage is not configured."
+    try:
+        ws = _worksheet(sid, sa, _secret("GOOGLE_SHEET_WORKSHEET", "feedback") or "feedback",
+                        ["submitted_at_utc", "feedback"])
+        _append_retry(ws, [datetime.now(timezone.utc).isoformat(), text.strip()])
+        return True, "Thank you for your feedback."
+    except Exception as e:
+        print(f"Feedback write error: {e}")
+        return False, "Could not submit feedback right now."
+
+
+def _write_traffic(event: str, session_id: str, details: str = "") -> None:
+    sa, sid = _service_account()
+    if not sa or not sid:
         return
-
-    executor = get_background_log_executor()
-
-    def _run() -> None:
-        try:
-            append_traffic_to_google_sheet(event_name, session_id, details)
-        finally:
-            semaphore.release()
-
-    executor.submit(_run)
-
-
-def validate_uploaded_file_bytes(file_bytes: bytes, mime_type: str = "") -> tuple[bool, str]:
-    allowed_mime_types = {"image/jpeg", "image/jpg", "image/png"}
-    allowed_pil_formats = {"JPEG", "PNG"}
-    file_size = len(file_bytes)
-
-    if file_size > MAX_UPLOAD_SIZE_BYTES:
-        return False, "Image size must be under 350 MB."
-
-    # MIME can be unreliable (e.g. application/octet-stream), so we validate
-    # actual content/format with Pillow before enforcing allowed image formats.
-
     try:
-        # First pass: verify the uploaded bytes are a valid image payload.
-        with Image.open(io.BytesIO(file_bytes)) as image:
-            image.verify()
-
-        # Second pass: reopen to safely read metadata/dimensions after verify().
-        with Image.open(io.BytesIO(file_bytes)) as image:
-            width, height = image.size
-            image_format = (image.format or "").upper()
-    except Exception:
-        return False, "Uploaded file is not a valid image."
-
-    if image_format not in allowed_pil_formats:
-        return False, "Only JPG, JPEG, and PNG files are allowed."
-
-    if width < MIN_UPLOAD_WIDTH or height < MIN_UPLOAD_HEIGHT:
-        return False, "Image resolution must be at least 300 x 300 pixels."
-    if width * height > MAX_UPLOAD_PIXELS:
-        return False, "Image resolution is too high. Please upload up to 40 megapixels."
-
-    return True, ""
+        ws = _worksheet(sid, sa, _secret("GOOGLE_TRAFFIC_WORKSHEET", "traffic") or "traffic",
+                        ["submitted_at_utc", "session_id", "event_name", "details"])
+        _append_retry(ws, [datetime.now(timezone.utc).isoformat(), session_id, event, details])
+    except Exception as e:
+        print(f"Traffic write error: {e}")
 
 
-def validate_feedback_text(feedback_text: str) -> tuple[bool, str]:
-    feedback = feedback_text.strip()
-    if len(feedback) < MIN_FEEDBACK_CHARS:
-        return False, "Feedback must be at least 10 characters."
-    if len(feedback) > MAX_FEEDBACK_CHARS:
-        return False, "Feedback must be under 1000 characters."
-    return True, ""
+# =========================================================================
+# Background traffic (fire-and-forget via thread pool)
+# =========================================================================
+
+@st.cache_resource(show_spinner=False)
+def _bg_pool() -> ThreadPoolExecutor:
+    return ThreadPoolExecutor(max_workers=2, thread_name_prefix="analytics")
 
 
-def enforce_session_rate_limit(
-    action: str,
-    cooldown_seconds: int,
-    max_actions_per_hour: int,
-) -> tuple[bool, str]:
-    now_ts = time.time()
-    state_key = f"rate_limit_{action}"
-    rate_state = st.session_state.setdefault(state_key, {"last_ts": 0.0, "events": []})
-
-    recent_events = [ts for ts in rate_state["events"] if now_ts - ts < 3600]
-    rate_state["events"] = recent_events
-
-    if now_ts - float(rate_state.get("last_ts", 0.0)) < cooldown_seconds:
-        wait_seconds = int(cooldown_seconds - (now_ts - float(rate_state["last_ts"]))) + 1
-        return False, f"Please wait {wait_seconds} seconds before trying again."
-
-    if len(recent_events) >= max_actions_per_hour:
-        return False, "Rate limit reached for this session. Please try again later."
-
-    rate_state["last_ts"] = now_ts
-    rate_state["events"].append(now_ts)
-    return True, ""
+_bg_slots = threading.Semaphore(BG_QUEUE_LIMIT)
 
 
-def append_feedback_to_google_sheet(feedback_text: str) -> tuple[bool, str]:
-    service_account_info, sheet_id = get_service_account_info()
-    worksheet_name = safe_get_secret("GOOGLE_SHEET_WORKSHEET", "feedback")
+def _log_event(event: str, session_id: str, details: str = "") -> None:
+    if not _bg_slots.acquire(blocking=False):
+        return
+    def _task() -> None:
+        try:
+            _write_traffic(event, session_id, details)
+        finally:
+            _bg_slots.release()
+    _bg_pool().submit(_task)
 
-    if not service_account_info or not sheet_id:
-        return (
-            False,
-            "Feedback storage is not configured yet. Please set GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_SHEET_ID.",
+
+# =========================================================================
+# Session & traffic counters
+# =========================================================================
+
+@st.cache_resource(show_spinner=False)
+def _counters() -> dict:
+    return {"seen": {}, "total": {}, "lock": threading.Lock()}
+
+
+def _session_id() -> str:
+    if "sid" not in st.session_state:
+        st.session_state["sid"] = str(uuid.uuid4())
+    return st.session_state["sid"]
+
+
+def _tick(sid: str) -> tuple[int, int]:
+    c = _counters()
+    now = time.time()
+    with c["lock"]:
+        c["seen"][sid] = now
+        c["total"][sid] = True
+        stale = [s for s, t in c["seen"].items() if now - t > SESSION_WINDOW]
+        for s in stale:
+            del c["seen"][s]
+        return len(c["seen"]), len(c["total"])
+
+
+# =========================================================================
+# UI sections
+# =========================================================================
+
+def _ui_hero() -> None:
+    st.title("Convert Any Photo to Indian Passport Seva Format")
+    st.markdown(
+        "**630 x 810 JPEG under 250 KB** — exactly what Passport Seva accepts. "
+        "Upload a portrait, get a compliant file in seconds."
+    )
+    c1, c2, c3 = st.columns(3)
+    c1.markdown("**Exact 630 x 810 px**")
+    c2.markdown("**JPEG under 250 KB**")
+    c3.markdown("**White background**")
+
+
+def _ui_checklist() -> None:
+    with st.expander("Before you upload — photo checklist", expanded=False):
+        st.markdown(
+            "- Face centered and looking straight at the camera\n"
+            "- Plain white or light background\n"
+            "- No shadows on face or wall\n"
+            "- No glasses\n"
+            "- Dark clothing preferred\n"
+            "- Head and shoulders visible"
         )
 
-    try:
-        client = get_google_sheet_client(service_account_info)
-        spreadsheet = client.open_by_key(sheet_id)
 
-        try:
-            worksheet = spreadsheet.worksheet(worksheet_name)
-        except gspread.WorksheetNotFound:
-            worksheet = spreadsheet.add_worksheet(title=worksheet_name, rows=1000, cols=2)
-
-        first_row = worksheet.row_values(1)
-        if not first_row:
-            append_row_with_retries(worksheet, ["submitted_at_utc", "feedback"])
-
-        append_row_with_retries(worksheet, [datetime.now(timezone.utc).isoformat(), feedback_text.strip()])
-        return True, "Thank you for your feedback. It has been saved."
-    except Exception as exc:
-        print(f"Feedback write error: {exc}")
-        return False, "Could not submit feedback right now. Please try again later."
+def _ui_disclaimer() -> None:
+    st.info(
+        "This tool resizes and compresses your image to Passport Seva format. "
+        "Upload a clear, front-facing photo with proper lighting for best results. "
+        "Official acceptance depends on photo quality and compliance, not only file dimensions."
+    )
 
 
-def get_process_memory_mb() -> float | None:
-    if psutil is None:
-        return None
-    try:
-        process = psutil.Process()
-        return float(process.memory_info().rss) / (1024 * 1024)
-    except Exception:
-        return None
+def _ui_adjustments() -> tuple[int, int, int, int]:
+    with st.expander("Manual adjustments (optional)", expanded=False):
+        c1, c2 = st.columns(2)
+        with c1:
+            br = st.slider("Brightness", -50, 50, 0, key="adj_br")
+            ct = st.slider("Contrast", -50, 50, 0, key="adj_ct")
+        with c2:
+            zm = st.slider("Zoom", 80, 120, 100, format="%d%%", key="adj_zm")
+            bg = st.slider("Background whiteness", 0, 100, 100, format="%d%%", key="adj_bg")
+    return br, ct, zm, bg
 
 
-def render_feedback_section() -> None:
+def _ui_compliance(data: bytes, quality: int, face_ok: bool, bg_ok: bool) -> None:
+    st.subheader("Compliance Report")
+    kb = len(data) / 1024
+    r1, r2 = st.columns(2)
+    with r1:
+        st.metric("Dimensions", f"{OUTPUT_W} x {OUTPUT_H} px")
+        st.metric("File Size", f"{kb:.1f} KB", delta="OK" if kb <= 250 else "Over limit")
+    with r2:
+        st.metric("Format", f"JPEG (quality {quality})")
+        st.metric("Background", "White" if bg_ok else "Needs improvement")
+    st.metric("Face Position", "Centered" if face_ok else "Not detected — adjust recommended")
+    if not face_ok:
+        st.warning("No face detected — centered crop was used. Upload a clear front-facing portrait.")
+    if not bg_ok:
+        st.warning("Background cleanup was partial. Try a photo with better lighting and contrast.")
+
+
+def _ui_privacy() -> None:
+    st.markdown("---")
+    st.subheader("Privacy & Trust")
+    p1, p2, p3, p4 = st.columns(4)
+    p1.markdown("**Temporary processing**\n\nPhotos processed in memory only")
+    p2.markdown("**No storage**\n\nImages never stored permanently")
+    p3.markdown("**No account**\n\nNo sign-up or login required")
+    p4.markdown("**Free to use**\n\nCompletely free, no hidden charges")
+
+
+def _ui_feedback() -> None:
     st.divider()
     st.subheader("Feedback")
     st.write("Please let us know if you face any issues.")
-    st.session_state.setdefault("feedback_nonce", 0)
-    feedback_key = f"feedback_text_{st.session_state['feedback_nonce']}"
-    feedback_text = st.text_area(
+    st.session_state.setdefault("fb_n", 0)
+    text = st.text_area(
         "Share your feedback",
-        key=feedback_key,
+        key=f"fb_{st.session_state['fb_n']}",
         placeholder="Tell us what went wrong or how we can improve...",
     )
     if st.button("Submit feedback"):
-        allowed, rate_limit_message = enforce_session_rate_limit(
-            action="feedback_submit",
-            cooldown_seconds=FEEDBACK_COOLDOWN_SECONDS,
-            max_actions_per_hour=MAX_FEEDBACK_PER_SESSION_PER_HOUR,
-        )
-        if not allowed:
-            st.warning(rate_limit_message)
-            return
-
-        is_valid, validation_message = validate_feedback_text(feedback_text)
-        if not is_valid:
-            st.warning(validation_message)
-            return
-
-        ok, message = append_feedback_to_google_sheet(feedback_text)
+        ok, msg = _rate_ok("fb", FEEDBACK_COOLDOWN, MAX_FEEDBACK_HR)
+        if not ok:
+            st.warning(msg); return
+        ok, msg = _validate_fb(text)
+        if not ok:
+            st.warning(msg); return
+        ok, msg = _write_feedback(text)
         if ok:
-            session_id = get_or_create_session_id()
-            enqueue_traffic_event("feedback_submitted", session_id, "feedback_form")
-            st.session_state["feedback_submitted_toast"] = "Feedback submitted successfully."
-            st.session_state["feedback_nonce"] += 1
+            _log_event("feedback_submitted", _session_id())
+            st.session_state["fb_toast"] = "Feedback submitted successfully."
+            st.session_state["fb_n"] += 1
             st.rerun()
         else:
-            st.error(message)
+            st.error(msg)
 
 
-def main() -> None:
-    st.set_page_config(page_title="Passport Photo Formatter", page_icon="📷", layout="centered")
-    st.session_state.setdefault("uploader_nonce", 0)
-    if "feedback_submitted_toast" in st.session_state:
-        st.toast(st.session_state.pop("feedback_submitted_toast"), icon="✅")
-    session_id = get_or_create_session_id()
-    active_count, total_visits = register_runtime_traffic(session_id)
-    if not st.session_state.get("visit_logged"):
-        enqueue_traffic_event("app_visit", session_id, "home_loaded")
-        st.session_state["visit_logged"] = True
-
-    st.title("Passport Photo Formatter")
-    allowed_text = "JPG, JPEG, and PNG"
-    upload_types = ["jpg", "jpeg", "png"]
-
-    st.write(
-        f"Upload a {allowed_text} portrait and export a `630 x 810` image with a white background, "
-        "tight head-and-shoulders framing, and a JPEG size target under `250 KB`."
-    )
-    uploaded_file = st.file_uploader(
-        f"Upload a {allowed_text} image",
-        type=upload_types,
-        key=f"passport_uploader_{st.session_state['uploader_nonce']}",
-    )
-
-    st.caption(
-        "Target spec: `630x810 px`, plain white/off-white background, "
-        "face framed to roughly `80-85%` passport-style coverage."
-    )
-
-    if uploaded_file:
-        file_bytes = uploaded_file.getvalue()
-        upload_signature = f"{uploaded_file.name}:{len(file_bytes)}"
-        if st.session_state.get("last_upload_rate_limit_signature") != upload_signature:
-            allowed, rate_limit_message = enforce_session_rate_limit(
-                action="photo_upload",
-                cooldown_seconds=UPLOAD_COOLDOWN_SECONDS,
-                max_actions_per_hour=MAX_UPLOADS_PER_SESSION_PER_HOUR,
-            )
-            if not allowed:
-                st.error(rate_limit_message)
-                render_feedback_section()
-                return
-            st.session_state["last_upload_rate_limit_signature"] = upload_signature
-
-        is_valid, validation_message = validate_uploaded_file_bytes(file_bytes, getattr(uploaded_file, "type", ""))
-        if not is_valid:
-            st.error(validation_message)
-            render_feedback_section()
-            return
-
-        (
-            encoded_bytes,
-            quality,
-            face_found,
-            background_refined,
-            result_preview_bytes,
-        ) = process_passport_from_bytes(file_bytes)
-        if st.session_state.get("last_tracked_upload") != upload_signature:
-            details = f"face_found={face_found},background_refined={background_refined}"
-            enqueue_traffic_event("photo_processed", session_id, details)
-            st.session_state["last_tracked_upload"] = upload_signature
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("Original")
-            st.image(file_bytes, use_container_width=True)
-
-        with col2:
-            st.subheader("Formatted")
-            st.image(result_preview_bytes, use_container_width=True)
-
-        st.success(
-            f"Export ready: `630x810 px`, `{len(encoded_bytes) / 1024:.1f} KB`, JPEG quality `{quality}`."
-        )
-
-        if face_found:
-            st.info("Face detection succeeded and the crop was aligned around the detected face.")
-        else:
-            st.warning(
-                "No face was detected, so the app used a centered crop. "
-                "For best results, upload a clear front-facing portrait."
-            )
-
-        if not background_refined:
-            st.warning(
-                "Background cleanup was partially skipped to preserve hair/body details. "
-                "Try a photo with better lighting and clearer contrast for best white-background results."
-            )
-
-        st.download_button(
-            label="Download formatted JPEG",
-            data=encoded_bytes,
-            file_name="passport_photo_630x810.jpg",
-            mime="image/jpeg",
-        )
-
-        action_col1, action_col2 = st.columns(2)
-        with action_col1:
-            if st.button("Clear"):
-                clear_photo_session()
-        with action_col2:
-            if st.button("I'm done"):
-                clear_photo_session()
-
-    render_feedback_section()
-
+def _ui_footer(active: int, visits: int) -> None:
     st.markdown("---")
     st.markdown(
         "For queries, write to us at "
         "[supportpassportphotoconversion@gmail.com](mailto:supportpassportphotoconversion@gmail.com)"
     )
+    st.caption(f"Live active users: `{active}` | Visits (runtime): `{visits}`")
 
-    memory_mb = get_process_memory_mb()
-    if memory_mb is None:
-        st.caption(f"Live active users: `{active_count}` | Visits (runtime): `{total_visits}`")
-    else:
-        estimated_mb_per_active_session = memory_mb / max(active_count, 1)
-        st.caption(
-            f"Live active users: `{active_count}` | Visits (runtime): `{total_visits}` | "
-            f"RAM: `{memory_mb:.1f} MB` | Est/session: `{estimated_mb_per_active_session:.1f} MB`"
-        )
+
+# =========================================================================
+# Main
+# =========================================================================
+
+def main() -> None:
+    st.set_page_config(page_title="Indian Passport Photo Converter", page_icon="📷", layout="centered")
+    st.markdown(_GREEN_BTN_CSS, unsafe_allow_html=True)
+    st.session_state.setdefault("nonce", 0)
+
+    if st.session_state.pop("downloaded", False):
+        st.toast("Passport photo downloaded!", icon="✅")
+        st.session_state["nonce"] += 1
+    if "fb_toast" in st.session_state:
+        st.toast(st.session_state.pop("fb_toast"), icon="✅")
+
+    sid = _session_id()
+    active, visits = _tick(sid)
+    if not st.session_state.get("v_logged"):
+        _log_event("app_visit", sid)
+        st.session_state["v_logged"] = True
+
+    _ui_hero()
+    st.markdown("---")
+    _ui_checklist()
+
+    uploaded = st.file_uploader(
+        "Upload a JPG, JPEG, or PNG image",
+        type=["jpg", "jpeg", "png"],
+        key=f"uploader_{st.session_state['nonce']}",
+    )
+    _ui_disclaimer()
+
+    if uploaded:
+        raw = uploaded.getvalue()
+        sig = f"{uploaded.name}:{len(raw)}"
+
+        if st.session_state.get("_ul_sig") != sig:
+            ok, msg = _rate_ok("upload", UPLOAD_COOLDOWN, MAX_UPLOADS_HR)
+            if not ok:
+                st.error(msg); _ui_feedback(); return
+            st.session_state["_ul_sig"] = sig
+
+        ok, msg = _validate(raw)
+        if not ok:
+            st.error(msg); _ui_feedback(); return
+
+        encoded, quality, face_ok, bg_ok, preview = _process(raw)
+
+        if st.session_state.get("_trk_sig") != sig:
+            _log_event("photo_processed", sid, f"face={face_ok},bg={bg_ok}")
+            st.session_state["_trk_sig"] = sig
+
+        br, ct, zm, bg = _ui_adjustments()
+        if br or ct or zm != 100 or bg != 100:
+            adj = _adjust(Image.open(io.BytesIO(preview)), br, ct, zm, bg)
+            encoded, quality = _encode_jpeg(adj)
+            buf = io.BytesIO()
+            adj.save(buf, format="JPEG", quality=88, optimize=True)
+            preview = buf.getvalue()
+
+        st.markdown("---")
+        c1, c2 = st.columns(2)
+        c1.subheader("Original")
+        c1.image(raw, use_container_width=True)
+        c2.subheader("Passport-Ready")
+        c2.image(preview, use_container_width=True)
+
+        _ui_compliance(encoded, quality, face_ok, bg_ok)
+
+        dl_col, reset_col = st.columns([3, 1])
+        with dl_col:
+            st.download_button(
+                "Download Passport JPEG", encoded,
+                file_name="passport_photo_630x810.jpg", mime="image/jpeg",
+                on_click=lambda: st.session_state.update(downloaded=True),
+            )
+        with reset_col:
+            if st.button("Start Over"):
+                st.session_state["nonce"] += 1
+                st.rerun()
+
+    _ui_privacy()
+    _ui_feedback()
+    _ui_footer(active, visits)
 
 
 if __name__ == "__main__":
