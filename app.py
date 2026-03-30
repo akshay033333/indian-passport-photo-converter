@@ -15,15 +15,6 @@ import numpy as np
 import streamlit as st
 from PIL import Image
 from streamlit.errors import StreamlitSecretNotFoundError
-HEIF_ENABLED = False
-try:
-    from pillow_heif import register_heif_opener  # pyright: ignore[reportMissingImports]
-
-    register_heif_opener()
-    HEIF_ENABLED = True
-except Exception:
-    pass
-
 try:
     import psutil  # pyright: ignore[reportMissingModuleSource]
 except Exception:
@@ -384,9 +375,6 @@ def enqueue_traffic_event(event_name: str, session_id: str, details: str = "") -
 def validate_uploaded_file_bytes(file_bytes: bytes, mime_type: str = "") -> tuple[bool, str]:
     allowed_mime_types = {"image/jpeg", "image/jpg", "image/png"}
     allowed_pil_formats = {"JPEG", "PNG"}
-    if HEIF_ENABLED:
-        allowed_mime_types.update({"image/heic", "image/heif"})
-        allowed_pil_formats.add("HEIF")
     file_size = len(file_bytes)
 
     if file_size > MAX_UPLOAD_SIZE_BYTES:
@@ -408,8 +396,6 @@ def validate_uploaded_file_bytes(file_bytes: bytes, mime_type: str = "") -> tupl
         return False, "Uploaded file is not a valid image."
 
     if image_format not in allowed_pil_formats:
-        if HEIF_ENABLED:
-            return False, "Only JPG, JPEG, PNG, HEIC, and HEIF files are allowed."
         return False, "Only JPG, JPEG, and PNG files are allowed."
 
     if width < MIN_UPLOAD_WIDTH or height < MIN_UPLOAD_HEIGHT:
@@ -544,9 +530,6 @@ def main() -> None:
     st.title("Passport Photo Formatter")
     allowed_text = "JPG, JPEG, and PNG"
     upload_types = ["jpg", "jpeg", "png"]
-    if HEIF_ENABLED:
-        allowed_text = "JPG, JPEG, PNG, HEIC, and HEIF"
-        upload_types.extend(["heic", "heif"])
 
     st.write(
         f"Upload a {allowed_text} portrait and export a `630 x 810` image with a white background, "
@@ -639,6 +622,13 @@ def main() -> None:
                 clear_photo_session()
 
     render_feedback_section()
+
+    st.markdown("---")
+    st.markdown(
+        "For queries, write to us at "
+        "[supportpassportphotoconversion@gmail.com](mailto:supportpassportphotoconversion@gmail.com)"
+    )
+
     memory_mb = get_process_memory_mb()
     if memory_mb is None:
         st.caption(f"Live active users: `{active_count}` | Visits (runtime): `{total_visits}`")
