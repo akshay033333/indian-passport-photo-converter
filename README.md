@@ -70,3 +70,7 @@ git@github.com:your-user/passport-photo-app.git
 - If a face is not detected, it falls back to a centered crop.
 - Docker is useful if you want a consistent runtime on your laptop, server, or cloud VM.
 - Use Python `3.11` or `3.12` for local setup and deployment. Avoid `3.13` for now until NumPy/OpenCV C-extension compatibility is fully stable.
+
+---
+
+![Indian Passport Photo Converter](assets/poster.png)
