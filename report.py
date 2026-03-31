@@ -92,7 +92,11 @@ def _service_account() -> tuple[dict, str]:
     sheet_id = _secret("GOOGLE_SHEET_ID")
     if not raw or not sheet_id:
         sys.exit("Missing GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SHEET_ID")
-    sa = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    if isinstance(raw, str):
+        raw = raw.strip().strip("'").strip('"').strip()
+        sa = json.loads(raw)
+    else:
+        sa = dict(raw)
     return sa, sheet_id
 
 
