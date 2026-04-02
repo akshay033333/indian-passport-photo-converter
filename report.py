@@ -31,17 +31,42 @@ from pathlib import Path
 import gspread
 from openpyxl import Workbook
 from openpyxl.chart import BarChart, LineChart, Reference
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.chart.label import DataLabelList
+from openpyxl.chart.layout import Layout, ManualLayout
+from openpyxl.chart.text import RichText
+from openpyxl.drawing.line import LineProperties
+from openpyxl.drawing.text import (
+    CharacterProperties,
+    Font as DrawingFont,
+    Paragraph,
+    ParagraphProperties,
+)
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 SECRETS_PATH = Path(__file__).parent / ".streamlit" / "secrets.toml"
 OUTPUT_DIR = Path(__file__).parent / "output"
 OUTPUT_FILE = OUTPUT_DIR / "passport_photo_dashboard.xlsx"
 
-HEADER_FONT = Font(bold=True, size=12, color="FFFFFF")
-HEADER_FILL = PatternFill(start_color="2563EB", end_color="2563EB", fill_type="solid")
-KPI_LABEL_FONT = Font(bold=True, size=11)
-KPI_VALUE_FONT = Font(bold=True, size=14, color="16A34A")
+# -- Palette (colorblind-friendly, high-contrast) --
+CLR_PRIMARY = "1E3A5F"
+CLR_VISITS = "0E7490"
+CLR_PHOTOS = "16A34A"
+CLR_FEEDBACK = "D97706"
+CLR_LIGHT_BG = "F8FAFC"
+CLR_BORDER = "E2E8F0"
+CLR_HEADER_BG = "1E3A5F"
+CLR_HEADER_FG = "FFFFFF"
+
+HEADER_FONT = Font(bold=True, size=11, color=CLR_HEADER_FG)
+HEADER_FILL = PatternFill(start_color=CLR_HEADER_BG, end_color=CLR_HEADER_BG, fill_type="solid")
+HEADER_ALIGN = Alignment(horizontal="center", vertical="center")
+KPI_LABEL_FONT = Font(bold=True, size=11, color="374151")
+KPI_VALUE_FONT = Font(bold=True, size=16, color=CLR_PRIMARY)
+INSIGHT_FONT = Font(italic=True, size=10, color="64748B")
+THIN_BORDER = Border(
+    bottom=Side(style="thin", color=CLR_BORDER),
+)
 
 
 # =========================================================================
@@ -196,94 +221,209 @@ def _style_header(ws, cols: int) -> None:
         cell = ws.cell(row=1, column=c)
         cell.font = HEADER_FONT
         cell.fill = HEADER_FILL
-        cell.alignment = Alignment(horizontal="center")
+        cell.alignment = HEADER_ALIGN
         ws.column_dimensions[get_column_letter(c)].width = 22
+    ws.row_dimensions[1].height = 28
+
+
+def _chart_title(text: str) -> RichText:
+    cp = CharacterProperties(
+        latin=DrawingFont(typeface="Calibri"),
+        sz=1200, b=True, solidFill=CLR_PRIMARY,
+    )
+    return RichText(p=[Paragraph(pPr=ParagraphProperties(defRPr=cp), endParaRPr=cp)])
+
+
+def _style_chart(chart, title: str, color: str, is_line: bool = False) -> None:
+    chart.width = 32
+    chart.height = 16
+    chart.title = title
+    chart.style = 2
+    chart.legend.position = "b"
+
+    chart.y_axis.majorGridlines.spPr = GraphicalProperties(
+        ln=LineProperties(solidFill="E5E7EB", w=6350)
+    )
+    chart.y_axis.tickLblPos = "low"
+    chart.y_axis.delete = False
+    chart.x_axis.tickLblPos = "low"
+    chart.x_axis.delete = False
+    chart.y_axis.title = None
+    chart.x_axis.title = None
+
+    chart.plot_area.graphicalProperties = GraphicalProperties()
+    chart.plot_area.graphicalProperties.noFill = True
+    chart.plot_area.graphicalProperties.line = LineProperties(noFill=True)
+
+    series = chart.series[0]
+    if is_line:
+        series.graphicalProperties.line.solidFill = color
+        series.graphicalProperties.line.width = 28000
+        series.smooth = True
+    else:
+        series.graphicalProperties.solidFill = color
+        series.graphicalProperties.line = LineProperties(noFill=True)
+
+
+def _add_data_labels(chart, show_val: bool = True) -> None:
+    dl = DataLabelList()
+    dl.showVal = show_val
+    dl.showCatName = False
+    dl.showSerName = False
+    dl.numFmt = "#,##0"
+    chart.series[0].dLbls = dl
+
+
+def _compute_insights(daily: list[tuple]) -> dict[str, str]:
+    if not daily:
+        return {"visits": "", "photos": "", "feedback": ""}
+
+    dates = [r[0] for r in daily]
+    visits = [r[1] for r in daily]
+    photos = [r[2] for r in daily]
+    feedbacks = [r[3] for r in daily]
+
+    peak_visit_idx = visits.index(max(visits))
+    peak_photo_idx = photos.index(max(photos))
+    total_fb = sum(feedbacks)
+
+    v_insight = f"Peak: {max(visits)} visits on {dates[peak_visit_idx]}."
+    if len(visits) >= 2:
+        diff = visits[-1] - visits[-2]
+        direction = "up" if diff > 0 else ("down" if diff < 0 else "flat")
+        v_insight += f" Latest trend: {direction} ({diff:+d} vs prior day)."
+
+    p_insight = f"Peak: {max(photos)} photos on {dates[peak_photo_idx]}. Total: {sum(photos)} processed."
+    if sum(visits) > 0:
+        rate = sum(photos) / sum(visits) * 100
+        p_insight += f" Conversion rate: {rate:.1f}%."
+
+    f_insight = f"{total_fb} feedback entries total."
+    if total_fb > 0:
+        peak_fb_idx = feedbacks.index(max(feedbacks))
+        f_insight += f" Busiest day: {dates[peak_fb_idx]} ({max(feedbacks)})."
+
+    return {"visits": v_insight, "photos": p_insight, "feedback": f_insight}
+
+
+from openpyxl.chart.shapes import GraphicalProperties
 
 
 def build_workbook(
     kpis: dict, daily: list[tuple], feedback_rows: list[tuple],
 ) -> Workbook:
     wb = Workbook()
+    insights = _compute_insights(daily)
 
-    # -- Sheet 1: KPI Summary --
-    ws_kpi = wb.active
-    ws_kpi.title = "KPI Summary"
-    ws_kpi.sheet_properties.tabColor = "2563EB"
-    ws_kpi.column_dimensions["A"].width = 30
-    ws_kpi.column_dimensions["B"].width = 25
+    # ── Sheet 1: KPI Summary ──
+    ws = wb.active
+    ws.title = "KPI Summary"
+    ws.sheet_properties.tabColor = CLR_PRIMARY
+    ws.column_dimensions["A"].width = 32
+    ws.column_dimensions["B"].width = 28
 
-    ws_kpi.cell(row=1, column=1, value="Passport Photo Converter — Daily Report").font = Font(bold=True, size=16)
-    ws_kpi.merge_cells("A1:B1")
-    row = 3
+    title_cell = ws.cell(row=1, column=1, value="Passport Photo Converter — Daily Report")
+    title_cell.font = Font(bold=True, size=18, color=CLR_PRIMARY)
+    ws.merge_cells("A1:B1")
+    ws.row_dimensions[1].height = 36
+
+    ws.cell(row=2, column=1, value="Key Performance Indicators").font = Font(
+        size=10, italic=True, color="94A3B8"
+    )
+    ws.merge_cells("A2:B2")
+
+    row = 4
     for label, value in kpis.items():
-        ws_kpi.cell(row=row, column=1, value=label).font = KPI_LABEL_FONT
-        ws_kpi.cell(row=row, column=2, value=value).font = KPI_VALUE_FONT
+        lc = ws.cell(row=row, column=1, value=label)
+        lc.font = KPI_LABEL_FONT
+        lc.border = THIN_BORDER
+        vc = ws.cell(row=row, column=2, value=value)
+        vc.font = KPI_VALUE_FONT
+        vc.alignment = Alignment(horizontal="right")
+        vc.border = THIN_BORDER
         row += 1
 
-    # -- Sheet 2: Daily Metrics --
+    # ── Sheet 2: Daily Metrics ──
     ws_daily = wb.create_sheet("Daily Metrics")
-    ws_daily.sheet_properties.tabColor = "16A34A"
+    ws_daily.sheet_properties.tabColor = CLR_PHOTOS
     headers = ["Date", "Visits", "Photos Processed", "Feedback"]
     ws_daily.append(headers)
     _style_header(ws_daily, len(headers))
-    for r in daily:
-        ws_daily.append(list(r))
 
-    # -- Sheet 3: Charts --
+    stripe = PatternFill(start_color=CLR_LIGHT_BG, end_color=CLR_LIGHT_BG, fill_type="solid")
+    for i, r in enumerate(daily):
+        ws_daily.append(list(r))
+        if i % 2 == 0:
+            for c in range(1, len(headers) + 1):
+                ws_daily.cell(row=i + 2, column=c).fill = stripe
+
+    # ── Sheet 3: Charts ──
     ws_charts = wb.create_sheet("Charts")
-    ws_charts.sheet_properties.tabColor = "F59E0B"
+    ws_charts.sheet_properties.tabColor = CLR_FEEDBACK
 
     if len(daily) >= 2:
         data_rows = len(daily) + 1
-
-        visits_chart = LineChart()
-        visits_chart.title = "Daily Visits"
-        visits_chart.y_axis.title = "Visits"
-        visits_chart.x_axis.title = "Date"
-        visits_chart.width = 28
-        visits_chart.height = 14
         cats = Reference(ws_daily, min_col=1, min_row=2, max_row=data_rows)
-        vals = Reference(ws_daily, min_col=2, min_row=1, max_row=data_rows)
-        visits_chart.add_data(vals, titles_from_data=True)
-        visits_chart.set_categories(cats)
-        visits_chart.style = 10
-        ws_charts.add_chart(visits_chart, "A1")
+        chart_row = 1
+        chart_spacing = 19
 
-        photos_chart = BarChart()
-        photos_chart.title = "Daily Photos Processed"
-        photos_chart.y_axis.title = "Photos"
-        photos_chart.x_axis.title = "Date"
-        photos_chart.width = 28
-        photos_chart.height = 14
+        # Chart 1: Daily Visits (line)
+        c1 = LineChart()
+        vals1 = Reference(ws_daily, min_col=2, min_row=1, max_row=data_rows)
+        c1.add_data(vals1, titles_from_data=True)
+        c1.set_categories(cats)
+        _style_chart(c1, "Daily Visits", CLR_VISITS, is_line=True)
+        ws_charts.add_chart(c1, f"A{chart_row}")
+
+        insight_row = chart_row + chart_spacing
+        ic = ws_charts.cell(row=insight_row, column=1, value=insights["visits"])
+        ic.font = INSIGHT_FONT
+        ws_charts.merge_cells(f"A{insight_row}:G{insight_row}")
+        chart_row = insight_row + 2
+
+        # Chart 2: Photos Processed (bar)
+        c2 = BarChart()
         vals2 = Reference(ws_daily, min_col=3, min_row=1, max_row=data_rows)
-        photos_chart.add_data(vals2, titles_from_data=True)
-        photos_chart.set_categories(cats)
-        photos_chart.style = 10
-        ws_charts.add_chart(photos_chart, "A18")
+        c2.add_data(vals2, titles_from_data=True)
+        c2.set_categories(cats)
+        _style_chart(c2, "Daily Photos Processed", CLR_PHOTOS)
+        _add_data_labels(c2)
+        ws_charts.add_chart(c2, f"A{chart_row}")
 
-        fb_chart = BarChart()
-        fb_chart.title = "Daily Feedback Volume"
-        fb_chart.y_axis.title = "Feedback"
-        fb_chart.x_axis.title = "Date"
-        fb_chart.width = 28
-        fb_chart.height = 14
+        insight_row = chart_row + chart_spacing
+        ic2 = ws_charts.cell(row=insight_row, column=1, value=insights["photos"])
+        ic2.font = INSIGHT_FONT
+        ws_charts.merge_cells(f"A{insight_row}:G{insight_row}")
+        chart_row = insight_row + 2
+
+        # Chart 3: Feedback Volume (bar)
+        c3 = BarChart()
         vals3 = Reference(ws_daily, min_col=4, min_row=1, max_row=data_rows)
-        fb_chart.add_data(vals3, titles_from_data=True)
-        fb_chart.set_categories(cats)
-        fb_chart.style = 10
-        ws_charts.add_chart(fb_chart, "A35")
-    else:
-        ws_charts.cell(row=1, column=1, value="Not enough data for charts (need at least 2 days).")
+        c3.add_data(vals3, titles_from_data=True)
+        c3.set_categories(cats)
+        _style_chart(c3, "Daily Feedback Volume", CLR_FEEDBACK)
+        _add_data_labels(c3)
+        ws_charts.add_chart(c3, f"A{chart_row}")
 
-    # -- Sheet 4: Raw Feedback --
+        insight_row = chart_row + chart_spacing
+        ic3 = ws_charts.cell(row=insight_row, column=1, value=insights["feedback"])
+        ic3.font = INSIGHT_FONT
+        ws_charts.merge_cells(f"A{insight_row}:G{insight_row}")
+    else:
+        ws_charts.cell(row=1, column=1, value="Not enough data for charts (need at least 2 days).").font = INSIGHT_FONT
+
+    # ── Sheet 4: Raw Feedback ──
     ws_fb = wb.create_sheet("Raw Feedback")
     ws_fb.sheet_properties.tabColor = "EF4444"
     fb_headers = ["Date", "Feedback"]
     ws_fb.append(fb_headers)
     _style_header(ws_fb, len(fb_headers))
     ws_fb.column_dimensions["B"].width = 80
-    for r in feedback_rows:
+    for i, r in enumerate(feedback_rows):
         ws_fb.append(list(r))
+        if i % 2 == 0:
+            for c in range(1, 3):
+                ws_fb.cell(row=i + 2, column=c).fill = stripe
 
     return wb
 
