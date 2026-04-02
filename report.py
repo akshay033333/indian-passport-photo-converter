@@ -15,6 +15,7 @@ import json
 import os
 import smtplib
 import sys
+import time
 from collections import Counter
 from datetime import date, datetime
 from email import encoders
@@ -29,6 +30,8 @@ SECRETS_PATH = Path(__file__).parent / ".streamlit" / "secrets.toml"
 OUTPUT_DIR = Path(__file__).parent / "output"
 OUTPUT_FILE = OUTPUT_DIR / "preview.html"
 APP_URL = "https://indianpassportphoto-converter-594qkvflp9pkfixcgakszh.streamlit.app/"
+SMTP_MAX_RETRIES = 5
+SMTP_RETRY_BASE_SECONDS = 5
 
 
 def _load_toml_secrets() -> dict[str, str]:
@@ -277,10 +280,26 @@ def send_email(html_path: Path, payload: dict, recipient: str, smtp_email: str, 
     part.add_header("Content-Disposition", f"attachment; filename={html_path.name}")
     msg.attach(part)
 
-    with smtplib.SMTP("smtp.gmail.com", 587) as server:
-        server.starttls()
-        server.login(smtp_email, smtp_password)
-        server.send_message(msg)
+    for attempt in range(SMTP_MAX_RETRIES):
+        try:
+            with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
+                server.starttls()
+                server.login(smtp_email, smtp_password)
+                server.send_message(msg)
+            return
+        except smtplib.SMTPDataError as exc:
+            is_transient = exc.smtp_code in {421, 450, 451, 452}
+            if not is_transient or attempt == SMTP_MAX_RETRIES - 1:
+                raise
+            delay = SMTP_RETRY_BASE_SECONDS * (2 ** attempt)
+            print(f"Temporary SMTP issue ({exc.smtp_code}). Retrying in {delay}s...")
+            time.sleep(delay)
+        except (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError) as exc:
+            if attempt == SMTP_MAX_RETRIES - 1:
+                raise
+            delay = SMTP_RETRY_BASE_SECONDS * (2 ** attempt)
+            print(f"SMTP connection issue ({exc}). Retrying in {delay}s...")
+            time.sleep(delay)
 
 
 def main() -> None:
