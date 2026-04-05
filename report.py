@@ -29,7 +29,7 @@ import gspread
 SECRETS_PATH = Path(__file__).parent / ".streamlit" / "secrets.toml"
 OUTPUT_DIR = Path(__file__).parent / "output"
 OUTPUT_FILE = OUTPUT_DIR / "preview.html"
-APP_URL = "https://indianpassportphoto-converter-594qkvflp9pkfixcgakszh.streamlit.app/"
+APP_URL = "https://passportphoto-converter.streamlit.app/"
 SMTP_MAX_RETRIES = 5
 SMTP_RETRY_BASE_SECONDS = 5
 
