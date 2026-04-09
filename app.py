@@ -31,9 +31,13 @@ MIN_ASPECT = 0.4
 MIN_FACE_AREA = 0.02
 ALLOWED_FORMATS = {"JPEG", "PNG"}
 
-# -- Crop geometry (Indian passport: face ≈ 36 % of frame height) --
-FACE_H_RATIO = 0.36
-HEAD_TOP_OFFSET = 0.30
+# -- Crop geometry --
+# We estimate the full head box from the detected facial box and crop so the
+# head occupies a passport-style portion of the final frame without distortion.
+TARGET_HEAD_HEIGHT_RATIO = 0.74
+TOP_MARGIN_RATIO = 0.07
+MIN_SECOND_FACE_RATIO = 0.38
+CENTER_DISTANCE_RATIO = 0.42
 
 # -- Rate limits --
 UPLOAD_COOLDOWN = 2
@@ -83,10 +87,22 @@ def _bgr_to_pil(arr: np.ndarray) -> Image.Image:
 def _detect_faces(bgr: np.ndarray) -> list[FaceBox]:
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-    rects = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80))
-    if len(rects) == 0:
+    eq = cv2.equalizeHist(gray)
+    candidates: list[FaceBox] = []
+
+    for img in (gray, eq):
+        rects = cascade.detectMultiScale(
+            img,
+            scaleFactor=1.08,
+            minNeighbors=8,
+            minSize=(90, 90),
+        )
+        candidates.extend(FaceBox(int(x), int(y), int(w), int(h)) for x, y, w, h in rects)
+
+    if not candidates:
         return []
-    return [FaceBox(int(x), int(y), int(w), int(h)) for x, y, w, h in rects]
+
+    return _filter_faces(candidates, bgr.shape[1], bgr.shape[0])
 
 
 def _largest_face(bgr: np.ndarray) -> FaceBox | None:
@@ -98,28 +114,94 @@ def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(v, hi))
 
 
+def _face_area(f: FaceBox) -> int:
+    return f.w * f.h
+
+
+def _iou(a: FaceBox, b: FaceBox) -> float:
+    x1 = max(a.x, b.x)
+    y1 = max(a.y, b.y)
+    x2 = min(a.x + a.w, b.x + b.w)
+    y2 = min(a.y + a.h, b.y + b.h)
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    inter = (x2 - x1) * (y2 - y1)
+    union = _face_area(a) + _face_area(b) - inter
+    return inter / union if union else 0.0
+
+
+def _contains(big: FaceBox, small: FaceBox) -> bool:
+    return (
+        small.x >= big.x
+        and small.y >= big.y
+        and small.x + small.w <= big.x + big.w
+        and small.y + small.h <= big.y + big.h
+    )
+
+
+def _filter_faces(candidates: list[FaceBox], img_w: int, img_h: int) -> list[FaceBox]:
+    if not candidates:
+        return []
+
+    candidates = sorted(candidates, key=_face_area, reverse=True)
+    deduped: list[FaceBox] = []
+    for cand in candidates:
+        if any(_iou(cand, kept) > 0.35 or _contains(kept, cand) for kept in deduped):
+            continue
+        deduped.append(cand)
+
+    if not deduped:
+        return []
+
+    largest = deduped[0]
+    largest_area = _face_area(largest)
+    img_center_x = img_w / 2
+    filtered: list[FaceBox] = []
+
+    for face in deduped:
+        area_ratio = _face_area(face) / largest_area
+        face_center_x = face.x + face.w / 2
+        center_ratio = abs(face_center_x - img_center_x) / img_w
+
+        # Ignore tiny or edge detections that commonly appear in shadows,
+        # patterns, or background objects.
+        if area_ratio < 0.18:
+            continue
+        if area_ratio < MIN_SECOND_FACE_RATIO and center_ratio > CENTER_DISTANCE_RATIO:
+            continue
+        filtered.append(face)
+
+    return filtered or [largest]
+
+
+def _max_crop_inside_image(img_w: int, img_h: int) -> tuple[float, float]:
+    if img_w / img_h > OUTPUT_ASPECT:
+        crop_h = float(img_h)
+        crop_w = crop_h * OUTPUT_ASPECT
+    else:
+        crop_w = float(img_w)
+        crop_h = crop_w / OUTPUT_ASPECT
+    return crop_w, crop_h
+
+
 def _crop_around_face(img_w: int, img_h: int, f: FaceBox) -> tuple[int, int, int, int]:
-    ch = f.h / FACE_H_RATIO
+    est_head_top = f.y - 0.22 * f.h
+    est_head_h = 1.34 * f.h
+    est_head_w = 1.48 * f.w
+
+    ch = est_head_h / TARGET_HEAD_HEIGHT_RATIO
     cw = ch * OUTPUT_ASPECT
+    cw = max(cw, est_head_w * 1.55)
+    ch = cw / OUTPUT_ASPECT
 
-    ch = max(ch, f.h * 2.5)
-    cw = max(cw, f.w * 2.0)
+    max_cw, max_ch = _max_crop_inside_image(img_w, img_h)
+    scale = min(max_cw / cw, max_ch / ch, 1.0)
+    cw *= scale
+    ch *= scale
 
-    # Enforce output aspect ratio after initial sizing
-    if cw / ch < OUTPUT_ASPECT:
-        cw = ch * OUTPUT_ASPECT
-    else:
-        ch = cw / OUTPUT_ASPECT
-
-    # Clamp to image bounds, then re-enforce aspect ratio
-    cw, ch = min(cw, float(img_w)), min(ch, float(img_h))
-    if cw / ch < OUTPUT_ASPECT:
-        cw = ch * OUTPUT_ASPECT
-    else:
-        ch = cw / OUTPUT_ASPECT
-
-    left = _clamp((f.x + f.w / 2) - cw / 2, 0, img_w - cw)
-    top = _clamp(f.y - ch * HEAD_TOP_OFFSET, 0, img_h - ch)
+    face_center_x = f.x + f.w / 2
+    left = _clamp(face_center_x - cw / 2, 0, img_w - cw)
+    top = _clamp(est_head_top - ch * TOP_MARGIN_RATIO, 0, img_h - ch)
     return int(round(left)), int(round(top)), int(round(left + cw)), int(round(top + ch))
 
 
@@ -178,7 +260,8 @@ def _whiten_bg(bgr: np.ndarray, face: FaceBox | None) -> tuple[np.ndarray, bool]
 
 def _build_passport(img: Image.Image) -> tuple[Image.Image, bool, bool]:
     bgr = _pil_to_bgr(img)
-    face = _largest_face(bgr)
+    faces = _detect_faces(bgr)
+    face = max(faces, key=_face_area) if faces else None
 
     if face:
         l, t, r, b = _crop_around_face(bgr.shape[1], bgr.shape[0], face)
@@ -189,6 +272,11 @@ def _build_passport(img: Image.Image) -> tuple[Image.Image, bool, bool]:
     bgr, bg_ok = _whiten_bg(bgr, _largest_face(bgr))
     bgr = cv2.resize(bgr, (OUTPUT_W, OUTPUT_H), interpolation=cv2.INTER_CUBIC)
     return _bgr_to_pil(bgr), face is not None, bg_ok
+
+
+def _head_height_ratio(face: FaceBox, frame_h: int) -> float:
+    estimated_head_h = 1.34 * face.h
+    return estimated_head_h / frame_h if frame_h else 0.0
 
 
 def _encode_jpeg(img: Image.Image, limit: int = MAX_OUTPUT_BYTES) -> tuple[bytes, int]:
@@ -296,6 +384,17 @@ def _validate(raw: bytes) -> tuple[bool, str]:
         f = faces[0]
         if (f.w * f.h) / (w * h) < MIN_FACE_AREA:
             return False, "Face is too small. Move closer so your face fills the frame."
+        head_ratio = _head_height_ratio(f, h)
+        if head_ratio < 0.58:
+            return False, (
+                "Face is too small for passport framing. Move closer, keep the camera about "
+                "1.2 to 1.5 meters away, and make sure the head fills most of the frame."
+            )
+        if head_ratio > 0.82:
+            return False, (
+                "Face is too large for passport framing. Step a little farther back so the head "
+                "and top of the shoulders fit naturally in the photo."
+            )
     except Exception:
         pass
 
@@ -516,6 +615,10 @@ def _ui_compliance(data: bytes, quality: int, face_ok: bool, bg_ok: bool) -> Non
         st.warning("No face detected — centered crop was used. Upload a clear front-facing portrait.")
     if not bg_ok:
         st.warning("Background cleanup was partial. Try a photo with better lighting and contrast.")
+    st.caption(
+        "The crop preserves the target passport aspect ratio before resizing, so the final "
+        "630 x 810 image is cropped and scaled without stretching the face."
+    )
 
 
 def _ui_privacy() -> None:
