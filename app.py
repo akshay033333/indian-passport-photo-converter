@@ -33,11 +33,16 @@ ALLOWED_FORMATS = {"JPEG", "PNG"}
 
 # -- Crop geometry --
 # We estimate the full head box from the detected facial box and crop so the
-# head occupies a passport-style portion of the final frame without distortion.
-TARGET_HEAD_HEIGHT_RATIO = 0.74
-TOP_MARGIN_RATIO = 0.07
-MIN_SECOND_FACE_RATIO = 0.38
-CENTER_DISTANCE_RATIO = 0.42
+# final image stays at passport aspect ratio while keeping the head inside the
+# acceptance band Passport Seva typically expects.
+TARGET_HEAD_HEIGHT_RATIO = 0.68
+MIN_HEAD_HEIGHT_RATIO = 0.62
+MAX_HEAD_HEIGHT_RATIO = 0.76
+TOP_MARGIN_RATIO = 0.09
+MIN_SECOND_FACE_RATIO = 0.45
+CENTER_DISTANCE_RATIO = 0.30
+PRIMARY_CENTER_WEIGHT = 0.20
+MIN_PRIMARY_DOMINANCE_RATIO = 2.2
 
 # -- Rate limits --
 UPLOAD_COOLDOWN = 2
@@ -76,6 +81,12 @@ class FaceBox:
     x: int; y: int; w: int; h: int
 
 
+@dataclass(frozen=True, slots=True)
+class FaceSelection:
+    primary: FaceBox
+    extras: tuple[FaceBox, ...]
+
+
 def _pil_to_bgr(img: Image.Image) -> np.ndarray:
     return cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2BGR)
 
@@ -108,6 +119,45 @@ def _detect_faces(bgr: np.ndarray) -> list[FaceBox]:
 def _largest_face(bgr: np.ndarray) -> FaceBox | None:
     faces = _detect_faces(bgr)
     return max(faces, key=lambda f: f.w * f.h) if faces else None
+
+
+def _select_faces(faces: list[FaceBox], img_w: int, img_h: int) -> FaceSelection | None:
+    if not faces:
+        return None
+
+    img_cx = img_w / 2
+    img_cy = img_h / 2
+    diag = (img_w ** 2 + img_h ** 2) ** 0.5
+
+    def _score(face: FaceBox) -> float:
+        area = _face_area(face)
+        cx = face.x + face.w / 2
+        cy = face.y + face.h / 2
+        center_dist = ((cx - img_cx) ** 2 + (cy - img_cy) ** 2) ** 0.5 / diag
+        return area * (1.0 - PRIMARY_CENTER_WEIGHT * center_dist)
+
+    ranked = sorted(faces, key=_score, reverse=True)
+    primary = ranked[0]
+    primary_area = _face_area(primary)
+    extras: list[FaceBox] = []
+
+    for face in ranked[1:]:
+        area_ratio = _face_area(face) / primary_area
+        cx = face.x + face.w / 2
+        cy = face.y + face.h / 2
+        center_dx = abs(cx - (primary.x + primary.w / 2)) / img_w
+        center_dy = abs(cy - (primary.y + primary.h / 2)) / img_h
+
+        if area_ratio < 0.32:
+            continue
+        if area_ratio < MIN_SECOND_FACE_RATIO and (center_dx > CENTER_DISTANCE_RATIO or center_dy > 0.22):
+            continue
+        extras.append(face)
+
+    if extras and primary_area / max(_face_area(face) for face in extras) >= MIN_PRIMARY_DOMINANCE_RATIO:
+        extras = []
+
+    return FaceSelection(primary=primary, extras=tuple(extras))
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:
@@ -205,6 +255,46 @@ def _crop_around_face(img_w: int, img_h: int, f: FaceBox) -> tuple[int, int, int
     return int(round(left)), int(round(top)), int(round(left + cw)), int(round(top + ch))
 
 
+def _crop_from_box(bgr: np.ndarray, box: tuple[int, int, int, int]) -> np.ndarray:
+    l, t, r, b = box
+    return bgr[t:b, l:r]
+
+
+def _refine_crop_box(img_w: int, img_h: int, face: FaceBox, box: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    l, t, r, b = box
+    crop_h = max(1, b - t)
+    ratio = _head_height_ratio(face, crop_h)
+
+    if MIN_HEAD_HEIGHT_RATIO <= ratio <= MAX_HEAD_HEIGHT_RATIO:
+        return box
+
+    target_crop_h = (1.34 * face.h) / TARGET_HEAD_HEIGHT_RATIO
+    target_crop_w = target_crop_h * OUTPUT_ASPECT
+
+    if ratio > MAX_HEAD_HEIGHT_RATIO:
+        target_crop_h = max(target_crop_h, crop_h)
+        target_crop_w = max(target_crop_w, crop_h * OUTPUT_ASPECT, r - l)
+    else:
+        target_crop_h = min(target_crop_h, crop_h)
+        target_crop_w = min(target_crop_w, crop_h * OUTPUT_ASPECT, r - l)
+
+    max_cw, max_ch = _max_crop_inside_image(img_w, img_h)
+    target_crop_w = min(target_crop_w, max_cw)
+    target_crop_h = min(target_crop_h, max_ch)
+    target_crop_h = target_crop_w / OUTPUT_ASPECT
+
+    cx = face.x + face.w / 2
+    est_head_top = face.y - 0.22 * face.h
+    left = _clamp(cx - target_crop_w / 2, 0, img_w - target_crop_w)
+    top = _clamp(est_head_top - target_crop_h * TOP_MARGIN_RATIO, 0, img_h - target_crop_h)
+    return (
+        int(round(left)),
+        int(round(top)),
+        int(round(left + target_crop_w)),
+        int(round(top + target_crop_h)),
+    )
+
+
 def _center_crop(bgr: np.ndarray) -> np.ndarray:
     h, w = bgr.shape[:2]
     if w / h > OUTPUT_ASPECT:
@@ -261,15 +351,18 @@ def _whiten_bg(bgr: np.ndarray, face: FaceBox | None) -> tuple[np.ndarray, bool]
 def _build_passport(img: Image.Image) -> tuple[Image.Image, bool, bool]:
     bgr = _pil_to_bgr(img)
     faces = _detect_faces(bgr)
-    face = max(faces, key=_face_area) if faces else None
+    selection = _select_faces(faces, bgr.shape[1], bgr.shape[0])
+    face = selection.primary if selection else None
 
     if face:
-        l, t, r, b = _crop_around_face(bgr.shape[1], bgr.shape[0], face)
-        bgr = bgr[t:b, l:r]
+        crop_box = _crop_around_face(bgr.shape[1], bgr.shape[0], face)
+        crop_box = _refine_crop_box(bgr.shape[1], bgr.shape[0], face, crop_box)
+        bgr = _crop_from_box(bgr, crop_box)
     else:
         bgr = _center_crop(bgr)
 
-    bgr, bg_ok = _whiten_bg(bgr, _largest_face(bgr))
+    cropped_face = _largest_face(bgr)
+    bgr, bg_ok = _whiten_bg(bgr, cropped_face)
     bgr = cv2.resize(bgr, (OUTPUT_W, OUTPUT_H), interpolation=cv2.INTER_CUBIC)
     return _bgr_to_pil(bgr), face is not None, bg_ok
 
@@ -277,6 +370,21 @@ def _build_passport(img: Image.Image) -> tuple[Image.Image, bool, bool]:
 def _head_height_ratio(face: FaceBox, frame_h: int) -> float:
     estimated_head_h = 1.34 * face.h
     return estimated_head_h / frame_h if frame_h else 0.0
+
+
+def _meaningful_face_count(faces: list[FaceBox], img_w: int, img_h: int) -> tuple[int, FaceBox | None]:
+    selection = _select_faces(faces, img_w, img_h)
+    if not selection:
+        return 0, None
+    return 1 + len(selection.extras), selection.primary
+
+
+def _analyze_output(img: Image.Image) -> tuple[int, float]:
+    bgr = _pil_to_bgr(img)
+    faces = _detect_faces(bgr)
+    count, primary = _meaningful_face_count(faces, bgr.shape[1], bgr.shape[0])
+    ratio = _head_height_ratio(primary, bgr.shape[0]) if primary else 0.0
+    return count, ratio
 
 
 def _encode_jpeg(img: Image.Image, limit: int = MAX_OUTPUT_BYTES) -> tuple[bytes, int]:
@@ -301,12 +409,13 @@ def _normalize(raw: bytes) -> Image.Image:
 
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL, max_entries=CACHE_MAX)
-def _process(raw: bytes) -> tuple[bytes, int, bool, bool, bytes]:
+def _process(raw: bytes) -> tuple[bytes, int, bool, bool, bytes, int, float]:
     result, face_ok, bg_ok = _build_passport(_normalize(raw))
+    out_face_count, out_head_ratio = _analyze_output(result)
     encoded, quality = _encode_jpeg(result)
     buf = io.BytesIO()
     result.save(buf, format="JPEG", quality=88, optimize=True)
-    return encoded, quality, face_ok, bg_ok, buf.getvalue()
+    return encoded, quality, face_ok, bg_ok, buf.getvalue(), out_face_count, out_head_ratio
 
 
 def _adjust(img: Image.Image, br: int, ct: int, zoom: int, bg_pct: int) -> Image.Image:
@@ -371,26 +480,27 @@ def _validate(raw: bytes) -> tuple[bool, str]:
     try:
         bgr = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2BGR)
         faces = _detect_faces(bgr)
-        if not faces:
+        face_count, primary = _meaningful_face_count(faces, w, h)
+        if not primary:
             return False, (
                 "No face detected. Upload a clear, front-facing portrait "
                 "with good lighting and no obstructions."
             )
-        if len(faces) > 1:
+        if face_count > 1:
             return False, (
-                f"Multiple faces detected ({len(faces)}). "
+                f"Multiple faces detected ({face_count}). "
                 "Passport photos must contain exactly one person."
             )
-        f = faces[0]
+        f = primary
         if (f.w * f.h) / (w * h) < MIN_FACE_AREA:
             return False, "Face is too small. Move closer so your face fills the frame."
         head_ratio = _head_height_ratio(f, h)
-        if head_ratio < 0.58:
+        if head_ratio < 0.54:
             return False, (
-                "Face is too small for passport framing. Move closer, keep the camera about "
-                "1.2 to 1.5 meters away, and make sure the head fills most of the frame."
+                "Face is too small for passport framing. Move slightly closer and keep your "
+                "head and upper shoulders clearly visible."
             )
-        if head_ratio > 0.82:
+        if head_ratio > 0.88:
             return False, (
                 "Face is too large for passport framing. Step a little farther back so the head "
                 "and top of the shoulders fit naturally in the photo."
@@ -600,7 +710,14 @@ def _ui_adjustments() -> tuple[int, int, int, int]:
     return br, ct, zm, bg
 
 
-def _ui_compliance(data: bytes, quality: int, face_ok: bool, bg_ok: bool) -> None:
+def _ui_compliance(
+    data: bytes,
+    quality: int,
+    face_ok: bool,
+    bg_ok: bool,
+    out_face_count: int,
+    out_head_ratio: float,
+) -> None:
     st.subheader("Compliance Report")
     kb = len(data) / 1024
     r1, r2 = st.columns(2)
@@ -610,14 +727,28 @@ def _ui_compliance(data: bytes, quality: int, face_ok: bool, bg_ok: bool) -> Non
     with r2:
         st.metric("Format", f"JPEG (quality {quality})")
         st.metric("Background", "White" if bg_ok else "Needs improvement")
+    face_status = "Single face" if out_face_count == 1 else ("Not detected" if out_face_count == 0 else f"{out_face_count} faces")
+    ratio_pct = f"{out_head_ratio * 100:.0f}%" if out_head_ratio else "Unavailable"
+    st.metric("Single-Person Check", face_status)
+    st.metric("Head Size", ratio_pct)
     st.metric("Face Position", "Centered" if face_ok else "Not detected — adjust recommended")
     if not face_ok:
         st.warning("No face detected — centered crop was used. Upload a clear front-facing portrait.")
+    if out_face_count > 1:
+        st.warning(
+            "The generated image still appears to contain more than one face-like region. "
+            "Try a cleaner background photo with only one person in frame."
+        )
+    if out_face_count == 1 and not (MIN_HEAD_HEIGHT_RATIO <= out_head_ratio <= MAX_HEAD_HEIGHT_RATIO):
+        st.warning(
+            "Head size is close to the Passport Seva rejection band. Try a photo where your "
+            "head and top of shoulders are clearly visible with some space above the head."
+        )
     if not bg_ok:
         st.warning("Background cleanup was partial. Try a photo with better lighting and contrast.")
     st.caption(
-        "The crop preserves the target passport aspect ratio before resizing, so the final "
-        "630 x 810 image is cropped and scaled without stretching the face."
+        "The app crops to the passport aspect ratio first and only then resizes to `630 x 810`, "
+        "so the face is not stretched or squashed."
     )
 
 
@@ -713,7 +844,7 @@ def main() -> None:
         if not ok:
             st.error(msg); _ui_feedback(); return
 
-        encoded, quality, face_ok, bg_ok, preview = _process(raw)
+        encoded, quality, face_ok, bg_ok, preview, out_face_count, out_head_ratio = _process(raw)
 
         if st.session_state.get("_trk_sig") != sig:
             _log_event("photo_processed", sid, f"face={face_ok},bg={bg_ok}")
@@ -726,6 +857,7 @@ def main() -> None:
             buf = io.BytesIO()
             adj.save(buf, format="JPEG", quality=88, optimize=True)
             preview = buf.getvalue()
+            out_face_count, out_head_ratio = _analyze_output(adj)
 
         st.markdown("---")
         c1, c2 = st.columns(2)
@@ -734,7 +866,7 @@ def main() -> None:
         c2.subheader("Passport-Ready")
         c2.image(preview, use_container_width=True)
 
-        _ui_compliance(encoded, quality, face_ok, bg_ok)
+        _ui_compliance(encoded, quality, face_ok, bg_ok, out_face_count, out_head_ratio)
 
         dl_col, reset_col = st.columns([3, 1])
         with dl_col:
