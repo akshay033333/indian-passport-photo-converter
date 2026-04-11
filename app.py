@@ -29,7 +29,7 @@ MAX_PIXELS = 40_000_000
 MAX_ASPECT = 2.0
 MIN_ASPECT = 0.4
 MIN_FACE_AREA = 0.02
-ALLOWED_FORMATS = {"JPEG", "PNG"}
+ALLOWED_FORMATS = {"JPEG", "PNG", "MPO"}
 
 # -- Crop geometry --
 # We estimate the full head box from the detected facial box and crop so the
@@ -145,10 +145,21 @@ def _select_faces(faces: list[FaceBox], img_w: int, img_h: int) -> FaceSelection
         area_ratio = _face_area(face) / primary_area
         cx = face.x + face.w / 2
         cy = face.y + face.h / 2
-        center_dx = abs(cx - (primary.x + primary.w / 2)) / img_w
-        center_dy = abs(cy - (primary.y + primary.h / 2)) / img_h
+        primary_cx = primary.x + primary.w / 2
+        primary_cy = primary.y + primary.h / 2
+        center_dx = abs(cx - primary_cx) / img_w
+        center_dy = abs(cy - primary_cy) / img_h
+        vertical_offset = (cy - primary_cy) / img_h
+        horizontal_overlap = max(
+            0,
+            min(primary.x + primary.w, face.x + face.w) - max(primary.x, face.x),
+        ) / max(1, min(primary.w, face.w))
 
         if area_ratio < 0.32:
+            continue
+        if vertical_offset > 0.20 and horizontal_overlap > 0.55:
+            # Common false positive on beards, collars, shirt prints, or torso texture
+            # directly below the real face.
             continue
         if area_ratio < MIN_SECOND_FACE_RATIO and (center_dx > CENTER_DISTANCE_RATIO or center_dy > 0.22):
             continue
