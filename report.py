@@ -16,7 +16,7 @@ import os
 import smtplib
 import sys
 import time
-from collections import Counter, defaultdict
+from collections import Counter
 from datetime import date, datetime
 from email import encoders
 from email.mime.base import MIMEBase
@@ -103,21 +103,17 @@ def _parse_datetime(iso_str: str) -> datetime | None:
         return None
 
 
-def compute_dashboard_payload(traffic: list[dict], feedback: list[dict]) -> dict:
+def compute_dashboard_payload(traffic: list[dict], feedback: list[dict], leads: list[dict]) -> dict:
     today = date.today()
     visits_by_day: Counter[date] = Counter()
     photos_by_day: Counter[date] = Counter()
     feedback_by_day: Counter[date] = Counter()
     unique_sessions: set[str] = set()
     today_sessions: set[str] = set()
-    session_stats: dict[str, dict[str, object]] = defaultdict(
-        lambda: {"visits": 0, "photos": 0, "last_seen": None}
-    )
 
     for row in traffic:
         ts_raw = str(row.get("submitted_at_utc", ""))
         day = _parse_day(ts_raw)
-        event_dt = _parse_datetime(ts_raw)
         if day is None:
             continue
         event = str(row.get("event_name", ""))
@@ -125,21 +121,13 @@ def compute_dashboard_payload(traffic: list[dict], feedback: list[dict]) -> dict
         if not sid:
             sid = "unknown"
 
-        session = session_stats[sid]
-        if event_dt is not None:
-            prev_seen = session["last_seen"]
-            if prev_seen is None or event_dt > prev_seen:
-                session["last_seen"] = event_dt
-
         if event == "app_visit":
             visits_by_day[day] += 1
             unique_sessions.add(sid)
             if day == today:
                 today_sessions.add(sid)
-            session["visits"] = int(session["visits"]) + 1
         elif event == "photo_processed":
             photos_by_day[day] += 1
-            session["photos"] = int(session["photos"]) + 1
 
     for row in feedback:
         day = _parse_day(str(row.get("submitted_at_utc", "")))
@@ -167,28 +155,21 @@ def compute_dashboard_payload(traffic: list[dict], feedback: list[dict]) -> dict
             insight += f" Latest trend: {direction} ({delta:+d} vs prior day)."
         return insight
 
-    session_tracking: list[dict[str, object]] = []
-    for sid, stats in session_stats.items():
-        visits_count = int(stats["visits"])
-        photos_count = int(stats["photos"])
-        total_events = visits_count + photos_count
-        if total_events == 0:
-            continue
-        last_seen = stats["last_seen"]
-        session_tracking.append(
+    recent_downloads: list[dict[str, str]] = []
+    for row in leads:
+        ts_raw = str(row.get("submitted_at_utc", "")).strip()
+        sid = str(row.get("session_id", "")).strip() or "unknown"
+        email = str(row.get("email", "")).strip().lower()
+        ts = _parse_datetime(ts_raw)
+        recent_downloads.append(
             {
+                "downloaded_at_utc": ts.isoformat() if ts else ts_raw,
                 "session_id": sid,
-                "visits": visits_count,
-                "photos": photos_count,
-                "total_events": total_events,
-                "last_seen_utc": last_seen.isoformat() if isinstance(last_seen, datetime) else "",
+                "email": email,
             }
         )
-    session_tracking.sort(
-        key=lambda x: (int(x["total_events"]), str(x["last_seen_utc"])),
-        reverse=True,
-    )
-    session_tracking = session_tracking[:30]
+    recent_downloads.sort(key=lambda x: str(x["downloaded_at_utc"]), reverse=True)
+    recent_downloads = recent_downloads[:30]
 
     return {
         "report_date": today.isoformat(),
@@ -211,7 +192,7 @@ def compute_dashboard_payload(traffic: list[dict], feedback: list[dict]) -> dict
             "photos": _insight(photos, "photos"),
             "feedback": _insight(feedback_vals, "feedback entries"),
         },
-        "session_tracking": session_tracking,
+        "recent_downloads": recent_downloads,
     }
 
 
@@ -261,22 +242,20 @@ tr:hover td {{ background:#f8fafc }}
 <div class="card"><h2>Daily Photos Processed</h2><div class="chart-wrap"><canvas id="c2"></canvas></div><div class="insight" id="ins2"></div></div>
 <div class="card"><h2>Daily Feedback Volume</h2><div class="chart-wrap"><canvas id="c3"></canvas></div><div class="insight" id="ins3"></div></div>
 <div class="card">
-  <h2>Session ID Tracking (Top 30 by activity)</h2>
+  <h2>Last Downloaded Times & Session IDs</h2>
   <div class="table-wrap">
     <table>
       <thead>
         <tr>
+          <th>Downloaded At (UTC)</th>
           <th>Session ID</th>
-          <th>Visits</th>
-          <th>Photos</th>
-          <th>Total Events</th>
-          <th>Last Seen (UTC)</th>
+          <th>Email</th>
         </tr>
       </thead>
-      <tbody id="session-body"></tbody>
+      <tbody id="downloads-body"></tbody>
     </table>
   </div>
-  <div class="insight">Tracks user activity by anonymous session ID from runtime analytics events.</div>
+  <div class="insight">Shows latest successful downloads captured by the email download gate.</div>
 </div>
 <script>
 const payload = {data_json};
@@ -284,7 +263,7 @@ const labels = payload.labels;
 const visits = payload.visits;
 const photos = payload.photos;
 const feedback = payload.feedback;
-const sessions = payload.session_tracking || [];
+const recentDownloads = payload.recent_downloads || [];
 const k = payload.kpis;
 document.getElementById('kpi-visits').textContent = k.total_visits.toLocaleString();
 document.getElementById('kpi-photos').textContent = k.total_photos.toLocaleString();
@@ -323,17 +302,15 @@ new Chart(document.getElementById('c3'), {{
   options:base
 }});
 
-const body = document.getElementById('session-body');
-if (!sessions.length) {{
-  body.innerHTML = '<tr><td colspan="5">No session activity available yet.</td></tr>';
+const downloadsBody = document.getElementById('downloads-body');
+if (!recentDownloads.length) {{
+  downloadsBody.innerHTML = '<tr><td colspan="3">No downloads tracked yet.</td></tr>';
 }} else {{
-  body.innerHTML = sessions.map((row) => `
+  downloadsBody.innerHTML = recentDownloads.map((row) => `
     <tr>
-      <td class="mono">${{row.session_id}}</td>
-      <td>${{row.visits}}</td>
-      <td>${{row.photos}}</td>
-      <td><strong>${{row.total_events}}</strong></td>
-      <td class="mono">${{row.last_seen_utc || '-'}}</td>
+      <td class="mono">${{row.downloaded_at_utc || '-'}}</td>
+      <td class="mono">${{row.session_id || '-'}}</td>
+      <td>${{row.email || '-'}}</td>
     </tr>
   `).join('');
 }}
@@ -349,12 +326,12 @@ def send_email(html_path: Path, payload: dict, recipient: str, smtp_email: str, 
     msg["Subject"] = f"Passport Dashboard — {payload['report_date']}"
 
     k = payload["kpis"]
-    top_session = (payload.get("session_tracking") or [{}])[0]
-    top_session_line = ""
-    if top_session and top_session.get("session_id"):
-        top_session_line = (
-            f"Top Session ID: {top_session.get('session_id')} "
-            f"({top_session.get('total_events')} events)\n"
+    last_download = (payload.get("recent_downloads") or [{}])[0]
+    last_download_line = ""
+    if last_download and last_download.get("session_id"):
+        last_download_line = (
+            f"Latest Download: {last_download.get('downloaded_at_utc')} "
+            f"(session: {last_download.get('session_id')})\n"
         )
     body = (
         f"Daily dashboard is generated.\n\n"
@@ -363,7 +340,7 @@ def send_email(html_path: Path, payload: dict, recipient: str, smtp_email: str, 
         f"Photos Processed: {k['total_photos']}\n"
         f"Conversion Rate: {k['conversion_rate']}\n"
         f"Feedback Entries: {k['feedback_entries']}\n\n"
-        f"{top_session_line}"
+        f"{last_download_line}"
         f"App: {APP_URL}\n"
     )
     msg.attach(MIMEText(body, "plain"))
@@ -406,6 +383,7 @@ def main() -> None:
     client = gspread.service_account_from_dict(sa)
     traffic_ws = _secret("GOOGLE_TRAFFIC_WORKSHEET") or "traffic"
     feedback_ws = _secret("GOOGLE_SHEET_WORKSHEET") or "feedback"
+    leads_ws = _secret("GOOGLE_EMAIL_WORKSHEET") or "email_leads"
 
     print(f"Fetching traffic from '{traffic_ws}'...")
     traffic = _fetch_rows(sheet_id, client, traffic_ws)
@@ -414,8 +392,11 @@ def main() -> None:
     print(f"Fetching feedback from '{feedback_ws}'...")
     feedback = _fetch_rows(sheet_id, client, feedback_ws)
     print(f"Feedback rows: {len(feedback)}")
+    print(f"Fetching leads from '{leads_ws}'...")
+    leads = _fetch_rows(sheet_id, client, leads_ws)
+    print(f"Lead rows: {len(leads)}")
 
-    payload = compute_dashboard_payload(traffic, feedback)
+    payload = compute_dashboard_payload(traffic, feedback, leads)
     html = render_html(payload)
     OUTPUT_DIR.mkdir(exist_ok=True)
     OUTPUT_FILE.write_text(html, encoding="utf-8")
