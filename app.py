@@ -1,14 +1,11 @@
 from __future__ import annotations
 
 import io
-import ipaddress
 import json
 import re
 import threading
 import time
 import uuid
-import urllib.error
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -63,7 +60,6 @@ SESSION_WINDOW = 300
 SHEET_RETRIES = 3
 SHEET_RETRY_DELAY = 0.4
 BG_QUEUE_LIMIT = 200
-IP_LOOKUP_TIMEOUT_SECONDS = 4
 
 # -- Feedback --
 FB_MIN_CHARS = 10
@@ -632,40 +628,15 @@ def _write_user_email(email: str, session_id: str, source: str = "download_gate"
     if not sa or not sid:
         return False, "Email storage is not configured."
     try:
-        client_ip, location = _get_client_ip_and_location()
         ws = _worksheet(
             sid,
             sa,
             _secret("GOOGLE_EMAIL_WORKSHEET", "email_leads") or "email_leads",
-            [
-                "submitted_at_utc",
-                "session_id",
-                "email",
-                "source",
-                "client_ip",
-                "country",
-                "region",
-                "city",
-                "timezone",
-                "latitude",
-                "longitude",
-            ],
+            ["submitted_at_utc", "session_id", "email", "source"],
         )
         _append_retry(
             ws,
-            [
-                datetime.now(timezone.utc).isoformat(),
-                session_id,
-                email.strip().lower(),
-                source,
-                client_ip,
-                location.get("country", ""),
-                location.get("region", ""),
-                location.get("city", ""),
-                location.get("timezone", ""),
-                location.get("latitude", ""),
-                location.get("longitude", ""),
-            ],
+            [datetime.now(timezone.utc).isoformat(), session_id, email.strip().lower(), source],
         )
         return True, "Email saved."
     except Exception as e:
@@ -683,84 +654,6 @@ def _write_traffic(event: str, session_id: str, details: str = "") -> None:
         _append_retry(ws, [datetime.now(timezone.utc).isoformat(), session_id, event, details])
     except Exception as e:
         print(f"Traffic write error: {e}")
-
-
-def _request_headers() -> dict[str, str]:
-    ctx = getattr(st, "context", None)
-    headers = getattr(ctx, "headers", None)
-    if not headers:
-        return {}
-    return {str(k).lower(): str(v) for k, v in dict(headers).items()}
-
-
-def _extract_client_ip(headers: dict[str, str]) -> str:
-    ip_keys = [
-        "x-forwarded-for",
-        "x-real-ip",
-        "cf-connecting-ip",
-        "x-client-ip",
-        "true-client-ip",
-        "fly-client-ip",
-    ]
-    for key in ip_keys:
-        raw = headers.get(key, "")
-        if not raw:
-            continue
-        first = raw.split(",")[0].strip()
-        if first.startswith("[") and "]" in first:
-            first = first[1:first.find("]")]
-        elif ":" in first and first.count(":") == 1 and "." in first:
-            first = first.split(":")[0]
-        try:
-            ip = ipaddress.ip_address(first)
-            return str(ip)
-        except ValueError:
-            continue
-    return "unknown"
-
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def _lookup_ip_location(client_ip: str) -> dict[str, str]:
-    if client_ip == "unknown":
-        return {}
-    try:
-        ip = ipaddress.ip_address(client_ip)
-        if ip.is_private or ip.is_loopback or ip.is_reserved or ip.is_link_local:
-            return {}
-    except ValueError:
-        return {}
-
-    url = (
-        f"http://ip-api.com/json/{client_ip}"
-        "?fields=status,country,regionName,city,lat,lon,timezone,query"
-    )
-    try:
-        with urllib.request.urlopen(url, timeout=IP_LOOKUP_TIMEOUT_SECONDS) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-        return {}
-
-    if payload.get("status") != "success":
-        return {}
-    return {
-        "country": str(payload.get("country", "")),
-        "region": str(payload.get("regionName", "")),
-        "city": str(payload.get("city", "")),
-        "timezone": str(payload.get("timezone", "")),
-        "latitude": str(payload.get("lat", "")),
-        "longitude": str(payload.get("lon", "")),
-    }
-
-
-def _get_client_ip_and_location() -> tuple[str, dict[str, str]]:
-    if "client_ip_meta" in st.session_state:
-        meta = st.session_state["client_ip_meta"]
-        return str(meta.get("ip", "unknown")), dict(meta.get("location", {}))
-    headers = _request_headers()
-    client_ip = _extract_client_ip(headers)
-    location = _lookup_ip_location(client_ip)
-    st.session_state["client_ip_meta"] = {"ip": client_ip, "location": location}
-    return client_ip, location
 
 
 # =========================================================================
@@ -949,9 +842,26 @@ def _ui_footer(active: int, visits: int) -> None:
     st.caption(f"Live active users: `{active}` | Visits (runtime): `{visits}`")
 
 
+def _ui_support_section() -> None:
+    st.markdown("---")
+    st.subheader("Your photo is ready!")
+    st.markdown("### Keep this tool free for everyone")
+    st.caption(
+        "Indian Passport Photo Converter is a solo project to make passport photo conversion "
+        "simple and accessible. If this tool saved you time, a small tip helps keep it running."
+    )
+    st.link_button(
+        "☕ Buy me a coffee",
+        "https://ko-fi.com/akshay4206",
+        type="primary",
+        use_container_width=True,
+    )
+
+
 def _on_download(email: str, upload_signature: str, session_id: str) -> None:
     st.session_state["downloaded"] = True
     st.session_state["pending_reset_nonce"] = True
+    st.session_state["show_support_cta"] = True
 
     # Avoid duplicate rows when users click download repeatedly on same file.
     lead_sig = f"{upload_signature}:{email.strip().lower()}"
@@ -1068,6 +978,8 @@ def main() -> None:
 
     _ui_privacy()
     _ui_feedback()
+    if st.session_state.get("show_support_cta", False):
+        _ui_support_section()
     _ui_footer(active, visits)
 
 
