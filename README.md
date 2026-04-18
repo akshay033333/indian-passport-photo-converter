@@ -11,7 +11,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-22c55e)](LICENSE)
 [![Open Source](https://img.shields.io/badge/Open%20Source-%E2%9D%A4-red)](#)
 
-[**Try the Live App**](https://indianpassportphoto-converter-594qkvflp9pkfixcgakszh.streamlit.app/) &nbsp;&middot;&nbsp; [View on GitHub](https://github.com/akshay033333/indian-passport-photo-converter) &nbsp;&middot;&nbsp; [Star this Repo](https://github.com/akshay033333/indian-passport-photo-converter/stargazers)
+[**Try the Live App**](https://passportphoto-converter.streamlit.app/) &nbsp;&middot;&nbsp; [View on GitHub](https://github.com/akshay033333/indian-passport-photo-converter) &nbsp;&middot;&nbsp; [Star this Repo](https://github.com/akshay033333/indian-passport-photo-converter/stargazers)
 
 </div>
 
