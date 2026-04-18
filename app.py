@@ -962,7 +962,6 @@ def _on_download(email: str, upload_signature: str, session_id: str) -> None:
         ok, msg = _write_user_email(email, session_id)
         if ok:
             st.session_state["last_saved_lead_sig"] = lead_sig
-            st.session_state["lead_toast"] = "Email saved to Google Sheet."
         else:
             st.session_state["lead_error"] = msg
 
@@ -982,8 +981,6 @@ def main() -> None:
         st.session_state["nonce"] += 1
     if "fb_toast" in st.session_state:
         st.toast(st.session_state.pop("fb_toast"), icon="✅")
-    if "lead_toast" in st.session_state:
-        st.toast(st.session_state.pop("lead_toast"), icon="✅")
     if "lead_error" in st.session_state:
         st.warning(st.session_state.pop("lead_error"))
 
