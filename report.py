@@ -16,7 +16,7 @@ import os
 import smtplib
 import sys
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import date, datetime
 from email import encoders
 from email.mime.base import MIMEBase
@@ -96,6 +96,13 @@ def _parse_day(iso_str: str) -> date | None:
         return None
 
 
+def _parse_datetime(iso_str: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
 def compute_dashboard_payload(traffic: list[dict], feedback: list[dict]) -> dict:
     today = date.today()
     visits_by_day: Counter[date] = Counter()
@@ -103,20 +110,36 @@ def compute_dashboard_payload(traffic: list[dict], feedback: list[dict]) -> dict
     feedback_by_day: Counter[date] = Counter()
     unique_sessions: set[str] = set()
     today_sessions: set[str] = set()
+    session_stats: dict[str, dict[str, object]] = defaultdict(
+        lambda: {"visits": 0, "photos": 0, "last_seen": None}
+    )
 
     for row in traffic:
-        day = _parse_day(str(row.get("submitted_at_utc", "")))
+        ts_raw = str(row.get("submitted_at_utc", ""))
+        day = _parse_day(ts_raw)
+        event_dt = _parse_datetime(ts_raw)
         if day is None:
             continue
         event = str(row.get("event_name", ""))
         sid = str(row.get("session_id", ""))
+        if not sid:
+            sid = "unknown"
+
+        session = session_stats[sid]
+        if event_dt is not None:
+            prev_seen = session["last_seen"]
+            if prev_seen is None or event_dt > prev_seen:
+                session["last_seen"] = event_dt
+
         if event == "app_visit":
             visits_by_day[day] += 1
             unique_sessions.add(sid)
             if day == today:
                 today_sessions.add(sid)
+            session["visits"] = int(session["visits"]) + 1
         elif event == "photo_processed":
             photos_by_day[day] += 1
+            session["photos"] = int(session["photos"]) + 1
 
     for row in feedback:
         day = _parse_day(str(row.get("submitted_at_utc", "")))
@@ -144,6 +167,29 @@ def compute_dashboard_payload(traffic: list[dict], feedback: list[dict]) -> dict
             insight += f" Latest trend: {direction} ({delta:+d} vs prior day)."
         return insight
 
+    session_tracking: list[dict[str, object]] = []
+    for sid, stats in session_stats.items():
+        visits_count = int(stats["visits"])
+        photos_count = int(stats["photos"])
+        total_events = visits_count + photos_count
+        if total_events == 0:
+            continue
+        last_seen = stats["last_seen"]
+        session_tracking.append(
+            {
+                "session_id": sid,
+                "visits": visits_count,
+                "photos": photos_count,
+                "total_events": total_events,
+                "last_seen_utc": last_seen.isoformat() if isinstance(last_seen, datetime) else "",
+            }
+        )
+    session_tracking.sort(
+        key=lambda x: (int(x["total_events"]), str(x["last_seen_utc"])),
+        reverse=True,
+    )
+    session_tracking = session_tracking[:30]
+
     return {
         "report_date": today.isoformat(),
         "kpis": {
@@ -165,6 +211,7 @@ def compute_dashboard_payload(traffic: list[dict], feedback: list[dict]) -> dict
             "photos": _insight(photos, "photos"),
             "feedback": _insight(feedback_vals, "feedback entries"),
         },
+        "session_tracking": session_tracking,
     }
 
 
@@ -193,6 +240,12 @@ h1 {{ font-size:24px; font-weight:700; color:#1e3a5f; margin-bottom:4px }}
 .card h2 {{ font-size:15px; font-weight:600; color:#1e3a5f; margin-bottom:12px }}
 .chart-wrap {{ position:relative; height:260px }}
 .insight {{ font-size:12px; color:#64748b; font-style:italic; margin-top:14px; padding-top:12px; border-top:1px solid #f1f5f9 }}
+.table-wrap {{ overflow-x:auto }}
+table {{ width:100%; border-collapse:collapse; font-size:12px }}
+th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid #f1f5f9 }}
+th {{ color:#64748b; font-weight:600; text-transform:uppercase; font-size:11px; letter-spacing:.5px }}
+tr:hover td {{ background:#f8fafc }}
+.mono {{ font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-size:11px }}
 </style>
 </head>
 <body>
@@ -207,12 +260,31 @@ h1 {{ font-size:24px; font-weight:700; color:#1e3a5f; margin-bottom:4px }}
 <div class="card"><h2>Daily Visits</h2><div class="chart-wrap"><canvas id="c1"></canvas></div><div class="insight" id="ins1"></div></div>
 <div class="card"><h2>Daily Photos Processed</h2><div class="chart-wrap"><canvas id="c2"></canvas></div><div class="insight" id="ins2"></div></div>
 <div class="card"><h2>Daily Feedback Volume</h2><div class="chart-wrap"><canvas id="c3"></canvas></div><div class="insight" id="ins3"></div></div>
+<div class="card">
+  <h2>Session ID Tracking (Top 30 by activity)</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Session ID</th>
+          <th>Visits</th>
+          <th>Photos</th>
+          <th>Total Events</th>
+          <th>Last Seen (UTC)</th>
+        </tr>
+      </thead>
+      <tbody id="session-body"></tbody>
+    </table>
+  </div>
+  <div class="insight">Tracks user activity by anonymous session ID from runtime analytics events.</div>
+</div>
 <script>
 const payload = {data_json};
 const labels = payload.labels;
 const visits = payload.visits;
 const photos = payload.photos;
 const feedback = payload.feedback;
+const sessions = payload.session_tracking || [];
 const k = payload.kpis;
 document.getElementById('kpi-visits').textContent = k.total_visits.toLocaleString();
 document.getElementById('kpi-photos').textContent = k.total_photos.toLocaleString();
@@ -250,6 +322,21 @@ new Chart(document.getElementById('c3'), {{
   data:{{labels,datasets:[{{data:feedback,backgroundColor:'#d97706',borderRadius:7,maxBarThickness:48}}]}},
   options:base
 }});
+
+const body = document.getElementById('session-body');
+if (!sessions.length) {{
+  body.innerHTML = '<tr><td colspan="5">No session activity available yet.</td></tr>';
+}} else {{
+  body.innerHTML = sessions.map((row) => `
+    <tr>
+      <td class="mono">${{row.session_id}}</td>
+      <td>${{row.visits}}</td>
+      <td>${{row.photos}}</td>
+      <td><strong>${{row.total_events}}</strong></td>
+      <td class="mono">${{row.last_seen_utc || '-'}}</td>
+    </tr>
+  `).join('');
+}}
 </script>
 </body>
 </html>"""
@@ -262,6 +349,13 @@ def send_email(html_path: Path, payload: dict, recipient: str, smtp_email: str, 
     msg["Subject"] = f"Passport Dashboard — {payload['report_date']}"
 
     k = payload["kpis"]
+    top_session = (payload.get("session_tracking") or [{}])[0]
+    top_session_line = ""
+    if top_session and top_session.get("session_id"):
+        top_session_line = (
+            f"Top Session ID: {top_session.get('session_id')} "
+            f"({top_session.get('total_events')} events)\n"
+        )
     body = (
         f"Daily dashboard is generated.\n\n"
         f"Report Date: {payload['report_date']}\n"
@@ -269,6 +363,7 @@ def send_email(html_path: Path, payload: dict, recipient: str, smtp_email: str, 
         f"Photos Processed: {k['total_photos']}\n"
         f"Conversion Rate: {k['conversion_rate']}\n"
         f"Feedback Entries: {k['feedback_entries']}\n\n"
+        f"{top_session_line}"
         f"App: {APP_URL}\n"
     )
     msg.attach(MIMEText(body, "plain"))

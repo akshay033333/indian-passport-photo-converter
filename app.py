@@ -1039,6 +1039,7 @@ def main() -> None:
 
         _ui_compliance(encoded, quality, face_ok, bg_ok, out_face_count, out_head_ratio)
 
+        st.subheader("Please enter your email address to download the Passport-ready photo")
         email_value = st.text_input(
             "Enter your email to enable download",
             key=f"download_email_{st.session_state['nonce']}",
