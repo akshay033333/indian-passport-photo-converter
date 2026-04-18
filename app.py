@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import io
+import ipaddress
 import json
+import re
 import threading
 import time
 import uuid
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -59,6 +63,7 @@ SESSION_WINDOW = 300
 SHEET_RETRIES = 3
 SHEET_RETRY_DELAY = 0.4
 BG_QUEUE_LIMIT = 200
+IP_LOOKUP_TIMEOUT_SECONDS = 4
 
 # -- Feedback --
 FB_MIN_CHARS = 10
@@ -70,6 +75,7 @@ div[data-testid="stDownloadButton"]>button{background:#22c55e;color:#fff;border:
 div[data-testid="stDownloadButton"]>button:hover{background:#16a34a;color:#fff;border:0}
 div[data-testid="stDownloadButton"]>button:active{background:#15803d;color:#fff}
 </style>"""
+EMAIL_PATTERN = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 
 
 # =========================================================================
@@ -531,6 +537,10 @@ def _validate_fb(text: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _is_valid_email(value: str) -> bool:
+    return bool(EMAIL_PATTERN.fullmatch(value.strip()))
+
+
 # =========================================================================
 # Rate limiting
 # =========================================================================
@@ -586,14 +596,20 @@ def _append_retry(ws: gspread.Worksheet, row: list[str]) -> None:
             time.sleep(SHEET_RETRY_DELAY * (2 ** i))
 
 
+def _ensure_header(ws: gspread.Worksheet, header: list[str]) -> None:
+    current = ws.row_values(1)
+    normalized = [str(c).strip() for c in current]
+    if normalized != header:
+        ws.update("A1", [header], value_input_option="RAW")
+
+
 def _worksheet(sheet_id: str, sa: dict, name: str, header: list[str]) -> gspread.Worksheet:
     sp = _gsheet_client(sa).open_by_key(sheet_id)
     try:
         ws = sp.worksheet(name)
     except gspread.WorksheetNotFound:
         ws = sp.add_worksheet(title=name, rows=2000, cols=len(header))
-    if not ws.row_values(1):
-        _append_retry(ws, header)
+    _ensure_header(ws, header)
     return ws
 
 
@@ -611,6 +627,52 @@ def _write_feedback(text: str) -> tuple[bool, str]:
         return False, "Could not submit feedback right now."
 
 
+def _write_user_email(email: str, session_id: str, source: str = "download_gate") -> tuple[bool, str]:
+    sa, sid = _service_account()
+    if not sa or not sid:
+        return False, "Email storage is not configured."
+    try:
+        client_ip, location = _get_client_ip_and_location()
+        ws = _worksheet(
+            sid,
+            sa,
+            _secret("GOOGLE_EMAIL_WORKSHEET", "email_leads") or "email_leads",
+            [
+                "submitted_at_utc",
+                "session_id",
+                "email",
+                "source",
+                "client_ip",
+                "country",
+                "region",
+                "city",
+                "timezone",
+                "latitude",
+                "longitude",
+            ],
+        )
+        _append_retry(
+            ws,
+            [
+                datetime.now(timezone.utc).isoformat(),
+                session_id,
+                email.strip().lower(),
+                source,
+                client_ip,
+                location.get("country", ""),
+                location.get("region", ""),
+                location.get("city", ""),
+                location.get("timezone", ""),
+                location.get("latitude", ""),
+                location.get("longitude", ""),
+            ],
+        )
+        return True, "Email saved."
+    except Exception as e:
+        print(f"Email write error: {e}")
+        return False, "Could not save email right now."
+
+
 def _write_traffic(event: str, session_id: str, details: str = "") -> None:
     sa, sid = _service_account()
     if not sa or not sid:
@@ -621,6 +683,84 @@ def _write_traffic(event: str, session_id: str, details: str = "") -> None:
         _append_retry(ws, [datetime.now(timezone.utc).isoformat(), session_id, event, details])
     except Exception as e:
         print(f"Traffic write error: {e}")
+
+
+def _request_headers() -> dict[str, str]:
+    ctx = getattr(st, "context", None)
+    headers = getattr(ctx, "headers", None)
+    if not headers:
+        return {}
+    return {str(k).lower(): str(v) for k, v in dict(headers).items()}
+
+
+def _extract_client_ip(headers: dict[str, str]) -> str:
+    ip_keys = [
+        "x-forwarded-for",
+        "x-real-ip",
+        "cf-connecting-ip",
+        "x-client-ip",
+        "true-client-ip",
+        "fly-client-ip",
+    ]
+    for key in ip_keys:
+        raw = headers.get(key, "")
+        if not raw:
+            continue
+        first = raw.split(",")[0].strip()
+        if first.startswith("[") and "]" in first:
+            first = first[1:first.find("]")]
+        elif ":" in first and first.count(":") == 1 and "." in first:
+            first = first.split(":")[0]
+        try:
+            ip = ipaddress.ip_address(first)
+            return str(ip)
+        except ValueError:
+            continue
+    return "unknown"
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def _lookup_ip_location(client_ip: str) -> dict[str, str]:
+    if client_ip == "unknown":
+        return {}
+    try:
+        ip = ipaddress.ip_address(client_ip)
+        if ip.is_private or ip.is_loopback or ip.is_reserved or ip.is_link_local:
+            return {}
+    except ValueError:
+        return {}
+
+    url = (
+        f"http://ip-api.com/json/{client_ip}"
+        "?fields=status,country,regionName,city,lat,lon,timezone,query"
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=IP_LOOKUP_TIMEOUT_SECONDS) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return {}
+
+    if payload.get("status") != "success":
+        return {}
+    return {
+        "country": str(payload.get("country", "")),
+        "region": str(payload.get("regionName", "")),
+        "city": str(payload.get("city", "")),
+        "timezone": str(payload.get("timezone", "")),
+        "latitude": str(payload.get("lat", "")),
+        "longitude": str(payload.get("lon", "")),
+    }
+
+
+def _get_client_ip_and_location() -> tuple[str, dict[str, str]]:
+    if "client_ip_meta" in st.session_state:
+        meta = st.session_state["client_ip_meta"]
+        return str(meta.get("ip", "unknown")), dict(meta.get("location", {}))
+    headers = _request_headers()
+    client_ip = _extract_client_ip(headers)
+    location = _lookup_ip_location(client_ip)
+    st.session_state["client_ip_meta"] = {"ip": client_ip, "location": location}
+    return client_ip, location
 
 
 # =========================================================================
@@ -809,6 +949,24 @@ def _ui_footer(active: int, visits: int) -> None:
     st.caption(f"Live active users: `{active}` | Visits (runtime): `{visits}`")
 
 
+def _on_download(email: str, upload_signature: str, session_id: str) -> None:
+    st.session_state["downloaded"] = True
+    st.session_state["pending_reset_nonce"] = True
+
+    # Avoid duplicate rows when users click download repeatedly on same file.
+    lead_sig = f"{upload_signature}:{email.strip().lower()}"
+    if st.session_state.get("last_saved_lead_sig") == lead_sig:
+        return
+
+    if _is_valid_email(email):
+        ok, msg = _write_user_email(email, session_id)
+        if ok:
+            st.session_state["last_saved_lead_sig"] = lead_sig
+            st.session_state["lead_toast"] = "Email saved to Google Sheet."
+        else:
+            st.session_state["lead_error"] = msg
+
+
 # =========================================================================
 # Main
 # =========================================================================
@@ -820,9 +978,14 @@ def main() -> None:
 
     if st.session_state.pop("downloaded", False):
         st.toast("Passport photo downloaded!", icon="✅")
+    if st.session_state.pop("pending_reset_nonce", False):
         st.session_state["nonce"] += 1
     if "fb_toast" in st.session_state:
         st.toast(st.session_state.pop("fb_toast"), icon="✅")
+    if "lead_toast" in st.session_state:
+        st.toast(st.session_state.pop("lead_toast"), icon="✅")
+    if "lead_error" in st.session_state:
+        st.warning(st.session_state.pop("lead_error"))
 
     sid = _session_id()
     active, visits = _tick(sid)
@@ -879,12 +1042,26 @@ def main() -> None:
 
         _ui_compliance(encoded, quality, face_ok, bg_ok, out_face_count, out_head_ratio)
 
+        email_value = st.text_input(
+            "Enter your email to enable download",
+            key=f"download_email_{st.session_state['nonce']}",
+            placeholder="name@example.com",
+            help="We only use this to ensure a valid recipient format before enabling download.",
+        )
+        email_ok = _is_valid_email(email_value)
+        if not email_value.strip():
+            st.caption("Add a valid email address to enable the download button.")
+        elif not email_ok:
+            st.warning("Please enter a valid email address.")
+
         dl_col, reset_col = st.columns([3, 1])
         with dl_col:
             st.download_button(
                 "Download Passport JPEG", encoded,
                 file_name="passport_photo_630x810.jpg", mime="image/jpeg",
-                on_click=lambda: st.session_state.update(downloaded=True),
+                on_click=_on_download,
+                args=(email_value, sig, sid),
+                disabled=not email_ok,
             )
         with reset_col:
             if st.button("Start Over"):
