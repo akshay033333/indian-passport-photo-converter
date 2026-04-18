@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import re
+import secrets
+import smtplib
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.message import EmailMessage
 
 import cv2
 import gspread
@@ -50,6 +54,10 @@ UPLOAD_COOLDOWN = 2
 FEEDBACK_COOLDOWN = 10
 MAX_UPLOADS_HR = 120
 MAX_FEEDBACK_HR = 30
+OTP_SEND_COOLDOWN = 60
+OTP_EXPIRY_SECONDS = 10 * 60
+MAX_OTP_ATTEMPTS = 5
+OTP_LENGTH = 6
 
 # -- Cache --
 CACHE_TTL = 1800
@@ -537,6 +545,139 @@ def _is_valid_email(value: str) -> bool:
     return bool(EMAIL_PATTERN.fullmatch(value.strip()))
 
 
+def _normalize_email(value: str) -> str:
+    return value.strip().lower()
+
+
+def _mask_email(value: str) -> str:
+    email = _normalize_email(value)
+    if "@" not in email:
+        return email
+    local, domain = email.split("@", 1)
+    if len(local) <= 2:
+        masked_local = local[0] + "*"
+    else:
+        masked_local = local[:2] + "*" * (len(local) - 2)
+    return f"{masked_local}@{domain}"
+
+
+def _hash_otp(email: str, otp: str, salt: str) -> str:
+    payload = f"{_normalize_email(email)}|{otp}|{salt}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _clear_otp_state() -> None:
+    for key in (
+        "otp_email",
+        "otp_hash",
+        "otp_salt",
+        "otp_expires_at",
+        "otp_last_sent_at",
+        "otp_attempts",
+        "otp_verified_at",
+    ):
+        st.session_state.pop(key, None)
+
+
+def _send_otp_email(recipient_email: str, otp_code: str) -> tuple[bool, str]:
+    smtp_email = _secret("SMTP_EMAIL")
+    smtp_password = _secret("SMTP_PASSWORD")
+    if not smtp_email or not smtp_password:
+        return False, "OTP email is not configured. Please set SMTP_EMAIL and SMTP_PASSWORD."
+
+    msg = EmailMessage()
+    msg["From"] = smtp_email
+    msg["To"] = recipient_email
+    msg["Subject"] = "Your OTP for Passport Photo Download"
+    msg.set_content(
+        "Your one-time verification code is:\n\n"
+        f"{otp_code}\n\n"
+        f"This code expires in {OTP_EXPIRY_SECONDS // 60} minutes.\n"
+        "If you did not request this, you can ignore this email."
+    )
+    try:
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
+            server.starttls()
+            server.login(smtp_email, smtp_password)
+            server.send_message(msg)
+        return True, f"OTP sent to {_mask_email(recipient_email)}."
+    except Exception:
+        return False, "Could not send OTP right now. Please try again."
+
+
+def _request_otp(email: str) -> tuple[bool, str]:
+    normalized = _normalize_email(email)
+    if not _is_valid_email(normalized):
+        return False, "Please enter a valid email address before requesting OTP."
+
+    now = time.time()
+    last_sent = float(st.session_state.get("otp_last_sent_at", 0.0))
+    otp_email = st.session_state.get("otp_email", "")
+    if otp_email == normalized and now - last_sent < OTP_SEND_COOLDOWN:
+        wait = int(OTP_SEND_COOLDOWN - (now - last_sent)) + 1
+        return False, f"Please wait {wait}s before requesting another OTP."
+
+    otp_code = f"{secrets.randbelow(10 ** OTP_LENGTH):0{OTP_LENGTH}d}"
+    otp_salt = secrets.token_hex(8)
+    otp_hash = _hash_otp(normalized, otp_code, otp_salt)
+    ok, message = _send_otp_email(normalized, otp_code)
+    if not ok:
+        return False, message
+
+    st.session_state["otp_email"] = normalized
+    st.session_state["otp_hash"] = otp_hash
+    st.session_state["otp_salt"] = otp_salt
+    st.session_state["otp_expires_at"] = now + OTP_EXPIRY_SECONDS
+    st.session_state["otp_last_sent_at"] = now
+    st.session_state["otp_attempts"] = 0
+    st.session_state["email_verified"] = False
+    st.session_state["verified_email"] = ""
+    return True, message
+
+
+def _verify_otp(email: str, entered_otp: str) -> tuple[bool, str]:
+    normalized = _normalize_email(email)
+    otp_email = st.session_state.get("otp_email", "")
+    if otp_email != normalized:
+        return False, "Please request OTP for this email first."
+
+    otp_hash = st.session_state.get("otp_hash")
+    otp_salt = st.session_state.get("otp_salt")
+    expires_at = float(st.session_state.get("otp_expires_at", 0.0))
+    if not otp_hash or not otp_salt or not expires_at:
+        return False, "OTP session not found. Please request OTP again."
+
+    if time.time() > expires_at:
+        _clear_otp_state()
+        return False, "OTP has expired. Please request a new one."
+
+    attempts = int(st.session_state.get("otp_attempts", 0))
+    if attempts >= MAX_OTP_ATTEMPTS:
+        _clear_otp_state()
+        return False, "Too many invalid OTP attempts. Please request a new OTP."
+
+    otp_value = entered_otp.strip()
+    if not (otp_value.isdigit() and len(otp_value) == OTP_LENGTH):
+        return False, f"Enter a {OTP_LENGTH}-digit OTP."
+
+    if _hash_otp(normalized, otp_value, otp_salt) != otp_hash:
+        attempts += 1
+        st.session_state["otp_attempts"] = attempts
+        remaining = max(0, MAX_OTP_ATTEMPTS - attempts)
+        if remaining == 0:
+            _clear_otp_state()
+            return False, "Too many invalid OTP attempts. Please request a new OTP."
+        return False, f"Invalid OTP. {remaining} attempt(s) remaining."
+
+    st.session_state["email_verified"] = True
+    st.session_state["verified_email"] = normalized
+    st.session_state["otp_verified_at"] = time.time()
+    st.session_state.pop("otp_hash", None)
+    st.session_state.pop("otp_salt", None)
+    st.session_state.pop("otp_attempts", None)
+    return True, "Email verified successfully. Download is now enabled."
+
+
 # =========================================================================
 # Rate limiting
 # =========================================================================
@@ -859,21 +1000,29 @@ def _ui_support_section() -> None:
 
 
 def _on_download(email: str, upload_signature: str, session_id: str) -> None:
+    normalized_email = _normalize_email(email)
+    is_verified = (
+        st.session_state.get("email_verified", False)
+        and st.session_state.get("verified_email", "") == normalized_email
+    )
+    if not is_verified:
+        st.session_state["lead_error"] = "Please verify your email with OTP before downloading."
+        return
+
     st.session_state["downloaded"] = True
     st.session_state["pending_reset_nonce"] = True
     st.session_state["show_support_cta"] = True
 
     # Avoid duplicate rows when users click download repeatedly on same file.
-    lead_sig = f"{upload_signature}:{email.strip().lower()}"
+    lead_sig = f"{upload_signature}:{normalized_email}"
     if st.session_state.get("last_saved_lead_sig") == lead_sig:
         return
 
-    if _is_valid_email(email):
-        ok, msg = _write_user_email(email, session_id)
-        if ok:
-            st.session_state["last_saved_lead_sig"] = lead_sig
-        else:
-            st.session_state["lead_error"] = msg
+    ok, msg = _write_user_email(normalized_email, session_id)
+    if ok:
+        st.session_state["last_saved_lead_sig"] = lead_sig
+    else:
+        st.session_state["lead_error"] = msg
 
 
 # =========================================================================
@@ -951,25 +1100,63 @@ def main() -> None:
 
         st.subheader("Please enter your email address to download the Passport-ready photo")
         email_value = st.text_input(
-            "Enter your email to enable download",
+            "Enter your email to request OTP",
             key=f"download_email_{st.session_state['nonce']}",
             placeholder="name@example.com",
-            help="We only use this to ensure a valid recipient format before enabling download.",
+            help="We'll send a one-time password (OTP) to verify email ownership before download.",
         )
-        email_ok = _is_valid_email(email_value)
+        email_normalized = _normalize_email(email_value)
+        email_ok = _is_valid_email(email_normalized)
+        if st.session_state.get("verified_email") != email_normalized:
+            st.session_state["email_verified"] = False
         if not email_value.strip():
-            st.caption("Add a valid email address to enable the download button.")
+            st.caption("Add a valid email address to request OTP.")
         elif not email_ok:
             st.warning("Please enter a valid email address.")
+        else:
+            otp_cols = st.columns([1, 1, 1])
+            with otp_cols[0]:
+                if st.button("Send OTP", key=f"send_otp_{st.session_state['nonce']}"):
+                    ok, message = _request_otp(email_normalized)
+                    if ok:
+                        st.success(message)
+                    else:
+                        st.warning(message)
+            otp_value = otp_cols[1].text_input(
+                "Enter OTP",
+                key=f"otp_value_{st.session_state['nonce']}",
+                max_chars=OTP_LENGTH,
+                placeholder="6-digit code",
+            )
+            with otp_cols[2]:
+                if st.button("Verify OTP", key=f"verify_otp_{st.session_state['nonce']}"):
+                    ok, message = _verify_otp(email_normalized, otp_value)
+                    if ok:
+                        st.success(message)
+                    else:
+                        st.warning(message)
+
+            email_verified = (
+                st.session_state.get("email_verified", False)
+                and st.session_state.get("verified_email", "") == email_normalized
+            )
+            if email_verified:
+                st.caption(f"Verified email: {_mask_email(email_normalized)}")
+            else:
+                st.caption("Verify your OTP to enable download.")
 
         dl_col, reset_col = st.columns([3, 1])
         with dl_col:
+            email_verified_for_download = (
+                st.session_state.get("email_verified", False)
+                and st.session_state.get("verified_email", "") == email_normalized
+            )
             st.download_button(
                 "Download Passport JPEG", encoded,
                 file_name="passport_photo_630x810.jpg", mime="image/jpeg",
                 on_click=_on_download,
                 args=(email_value, sig, sid),
-                disabled=not email_ok,
+                disabled=not email_verified_for_download,
             )
         with reset_col:
             if st.button("Start Over"):
