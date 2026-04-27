@@ -80,6 +80,27 @@ div[data-testid="stDownloadButton"]>button:hover{background:#16a34a;color:#fff;b
 div[data-testid="stDownloadButton"]>button:active{background:#15803d;color:#fff}
 </style>"""
 EMAIL_PATTERN = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+DEBUG_LOG_PATH = "/Users/akshaykailasa/Documents/photo_passport_app/.cursor/debug-7fd596.log"
+DEBUG_SESSION_ID = "7fd596"
+
+
+def _debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data: dict) -> None:
+    # #region agent log
+    try:
+        payload = {
+            "sessionId": DEBUG_SESSION_ID,
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+    except Exception:
+        pass
+    # #endregion
 
 
 # =========================================================================
@@ -638,6 +659,20 @@ def _request_otp(email: str) -> tuple[bool, str]:
 def _verify_otp(email: str, entered_otp: str) -> tuple[bool, str]:
     normalized = _normalize_email(email)
     otp_email = st.session_state.get("otp_email", "")
+    _debug_log(
+        "otp-ui-debug",
+        "H1",
+        "app.py:_verify_otp:entry",
+        "verify_otp called",
+        {
+            "email_matches_otp_email": otp_email == normalized,
+            "has_otp_hash": bool(st.session_state.get("otp_hash")),
+            "has_otp_salt": bool(st.session_state.get("otp_salt")),
+            "has_expiry": bool(st.session_state.get("otp_expires_at")),
+            "entered_len": len(entered_otp.strip()),
+            "entered_isdigit": entered_otp.strip().isdigit(),
+        },
+    )
     if otp_email != normalized:
         return False, "Please request OTP for this email first."
 
@@ -658,6 +693,17 @@ def _verify_otp(email: str, entered_otp: str) -> tuple[bool, str]:
 
     otp_value = entered_otp.strip()
     if not (otp_value.isdigit() and len(otp_value) == OTP_LENGTH):
+        _debug_log(
+            "otp-ui-debug",
+            "H2",
+            "app.py:_verify_otp:format_guard",
+            "otp format guard rejected input",
+            {
+                "entered_len": len(otp_value),
+                "entered_isdigit": otp_value.isdigit(),
+                "otp_length_required": OTP_LENGTH,
+            },
+        )
         return False, f"Enter a {OTP_LENGTH}-digit OTP."
 
     if _hash_otp(normalized, otp_value, otp_salt) != otp_hash:
@@ -865,6 +911,11 @@ def _ui_hero() -> None:
 
 def _ui_checklist() -> None:
     with st.expander("Before you upload — photo checklist", expanded=False):
+        st.image(
+            "assets/requirements.png",
+            caption="Official photo requirements illustration",
+            use_container_width=True,
+        )
         st.markdown(
             "- Face centered and looking straight at the camera\n"
             "- Plain white or light background\n"
@@ -1128,9 +1179,48 @@ def main() -> None:
                 max_chars=OTP_LENGTH,
                 placeholder="6-digit code",
             )
+            _debug_log(
+                "otp-ui-debug",
+                "H3",
+                "app.py:main:otp_input_render",
+                "otp input rendered",
+                {
+                    "otp_value_len": len(otp_value),
+                    "otp_value_isdigit": otp_value.isdigit() if otp_value else False,
+                    "email_ok": email_ok,
+                    "email_verified_flag": bool(st.session_state.get("email_verified", False)),
+                },
+            )
             with otp_cols[2]:
                 if st.button("Verify OTP", key=f"verify_otp_{st.session_state['nonce']}"):
+                    _debug_log(
+                        "otp-ui-debug",
+                        "H4",
+                        "app.py:main:verify_click",
+                        "verify button pressed",
+                        {
+                            "otp_value_len": len(otp_value.strip()),
+                            "otp_value_isdigit": otp_value.strip().isdigit(),
+                            "email_matches_verified_email": st.session_state.get("verified_email", "") == email_normalized,
+                        },
+                    )
                     ok, message = _verify_otp(email_normalized, otp_value)
+                    _debug_log(
+                        "otp-ui-debug",
+                        "H5",
+                        "app.py:main:verify_result",
+                        "verify result received",
+                        {
+                            "verify_ok": ok,
+                            "message_key": (
+                                "invalid_format" if "6-digit" in message.lower()
+                                else "request_first" if "request otp" in message.lower()
+                                else "expired" if "expired" in message.lower()
+                                else "attempts" if "attempt" in message.lower()
+                                else "other"
+                            ),
+                        },
+                    )
                     if ok:
                         st.success(message)
                     else:

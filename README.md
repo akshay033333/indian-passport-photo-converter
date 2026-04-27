@@ -34,6 +34,7 @@ Upload a portrait. Get a **Passport Seva–compliant JPEG** back in seconds. No 
 - **White background** — replaces colored backgrounds with clean white via GrabCut
 - **Smart validation** — rejects landscape images, multi-face photos, and non-portraits before processing
 - **Manual adjustments** — fine-tune brightness, contrast, zoom, and background whiteness
+- **Before-upload checklist** — includes an official requirements illustration to help users capture a valid photo
 - **Side-by-side preview** — compare original and passport-ready images before downloading
 - **Compliance report** — shows dimensions, file size, format, background status, and face position
 - **Privacy-first** — photos are processed in memory only, never stored
@@ -99,8 +100,9 @@ indian-passport-photo-converter/
 ├── Dockerfile              # Docker containerization
 ├── .github/workflows/      # GitHub Actions (daily report scheduling)
 ├── .streamlit/             # Streamlit secrets (git-ignored)
-├── assets/                 # Images for README
-│   └── poster.png
+├── assets/                 # App/README image assets
+│   ├── poster.png
+│   └── requirements.png
 ├── output/                 # Generated reports (git-ignored)
 ├── LICENSE
 └── README.md
