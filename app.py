@@ -73,6 +73,17 @@ BG_QUEUE_LIMIT = 200
 FB_MIN_CHARS = 10
 FB_MAX_CHARS = 1000
 
+# -- Referral source --
+REFERRAL_SOURCES = (
+    "Reddit",
+    "Google Search",
+    "Youtube",
+    "Streamlit community",
+    "Other",
+)
+REFERRAL_OTHER_MIN_CHARS = 3
+REFERRAL_OTHER_MAX_CHARS = 500
+
 # -- Custom CSS --
 _GREEN_BTN_CSS = """<style>
 div[data-testid="stDownloadButton"]>button{background:#22c55e;color:#fff;border:0;font-weight:600}
@@ -562,6 +573,18 @@ def _validate_fb(text: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _validate_referral(source: str, other_details: str) -> tuple[bool, str]:
+    if source not in REFERRAL_SOURCES:
+        return False, "Please select how you heard about this app."
+    if source == "Other":
+        t = other_details.strip()
+        if len(t) < REFERRAL_OTHER_MIN_CHARS:
+            return False, f"Please describe where you heard about us (at least {REFERRAL_OTHER_MIN_CHARS} characters)."
+        if len(t) > REFERRAL_OTHER_MAX_CHARS:
+            return False, f"Description must be under {REFERRAL_OTHER_MAX_CHARS} characters."
+    return True, ""
+
+
 def _is_valid_email(value: str) -> bool:
     return bool(EMAIL_PATTERN.fullmatch(value.strip()))
 
@@ -810,6 +833,32 @@ def _write_feedback(text: str) -> tuple[bool, str]:
         return False, "Could not submit feedback right now."
 
 
+def _write_referral_source(session_id: str, source: str, other_details: str = "") -> tuple[bool, str]:
+    sa, sid = _service_account()
+    if not sa or not sid:
+        return False, "Referral tracking is not configured."
+    try:
+        ws = _worksheet(
+            sid,
+            sa,
+            _secret("GOOGLE_REFERRAL_WORKSHEET", "referral_sources") or "referral_sources",
+            ["submitted_at_utc", "session_id", "source", "other_details"],
+        )
+        _append_retry(
+            ws,
+            [
+                datetime.now(timezone.utc).isoformat(),
+                session_id,
+                source,
+                other_details.strip() if source == "Other" else "",
+            ],
+        )
+        return True, "Thank you for sharing."
+    except Exception as e:
+        print(f"Referral write error: {e}")
+        return False, "Could not save your response right now."
+
+
 def _write_user_email(email: str, session_id: str, source: str = "download_gate") -> tuple[bool, str]:
     sa, sid = _service_account()
     if not sa or not sid:
@@ -1025,6 +1074,46 @@ def _ui_feedback() -> None:
             st.error(msg)
 
 
+def _ui_referral_source() -> None:
+    st.divider()
+    st.subheader("How did you hear about us?")
+    if st.session_state.get("referral_submitted"):
+        st.caption("Thanks — we've recorded your response.")
+        return
+
+    st.write("Help us understand where people discover this app.")
+    st.session_state.setdefault("ref_n", 0)
+    source = st.radio(
+        "Where did you find this app?",
+        REFERRAL_SOURCES,
+        key=f"ref_src_{st.session_state['ref_n']}",
+    )
+    other_details = ""
+    if source == "Other":
+        other_details = st.text_area(
+            "Please tell us more",
+            key=f"ref_other_{st.session_state['ref_n']}",
+            placeholder="e.g. friend, blog post, social media...",
+        )
+    if st.button("Submit", key=f"ref_submit_{st.session_state['ref_n']}"):
+        ok, msg = _rate_ok("referral", FEEDBACK_COOLDOWN, MAX_FEEDBACK_HR)
+        if not ok:
+            st.warning(msg)
+            return
+        ok, msg = _validate_referral(source, other_details)
+        if not ok:
+            st.warning(msg)
+            return
+        ok, msg = _write_referral_source(_session_id(), source, other_details)
+        if ok:
+            _log_event("referral_submitted", _session_id(), source)
+            st.session_state["referral_submitted"] = True
+            st.session_state["ref_toast"] = msg
+            st.rerun()
+        else:
+            st.error(msg)
+
+
 def _ui_footer(active: int, visits: int) -> None:
     st.markdown("---")
     st.markdown(
@@ -1091,6 +1180,8 @@ def main() -> None:
         st.session_state["nonce"] += 1
     if "fb_toast" in st.session_state:
         st.toast(st.session_state.pop("fb_toast"), icon="✅")
+    if "ref_toast" in st.session_state:
+        st.toast(st.session_state.pop("ref_toast"), icon="✅")
     if "lead_error" in st.session_state:
         st.warning(st.session_state.pop("lead_error"))
 
@@ -1255,6 +1346,7 @@ def main() -> None:
 
     _ui_privacy()
     _ui_feedback()
+    _ui_referral_source()
     if st.session_state.get("show_support_cta", False):
         _ui_support_section()
     _ui_footer(active, visits)
