@@ -948,6 +948,10 @@ def _tick(sid: str) -> tuple[int, int]:
 
 def _ui_hero() -> None:
     st.title("Convert Any Photo to Indian Passport Seva Format")
+    st.header(
+        "Free online Indian passport photo converter — resize to 630 x 810 px, "
+        "white background, JPEG under 250 KB for Passport Seva upload."
+    )
     st.markdown(
         "**630 x 810 JPEG under 250 KB** — exactly what Passport Seva accepts. "
         "Upload a portrait, get a compliant file in seconds."
@@ -1170,7 +1174,11 @@ def _on_download(email: str, upload_signature: str, session_id: str) -> None:
 # =========================================================================
 
 def main() -> None:
-    st.set_page_config(page_title="Indian Passport Photo Converter", page_icon="📷", layout="centered")
+    st.set_page_config(
+        page_title="Indian Passport Photo Converter | 630x810 JPEG for Passport Seva",
+        page_icon="📷",
+        layout="centered",
+    )
     st.markdown(_GREEN_BTN_CSS, unsafe_allow_html=True)
     st.session_state.setdefault("nonce", 0)
 
