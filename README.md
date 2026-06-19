@@ -7,7 +7,7 @@
 `630 x 810 px` &nbsp;&middot;&nbsp; `White background` &nbsp;&middot;&nbsp; `Under 250 KB`
 
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Streamlit](https://img.shields.io/badge/Streamlit-App-FF4B4B?logo=streamlit&logoColor=white)](https://indianpassportphoto-converter-594qkvflp9pkfixcgakszh.streamlit.app/)
+[![Streamlit](https://img.shields.io/badge/Streamlit-App-FF4B4B?logo=streamlit&logoColor=white)](https://passportphoto-converter.streamlit.app/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-22c55e)](LICENSE)
 [![Open Source](https://img.shields.io/badge/Open%20Source-%E2%9D%A4-red)](#)
 
@@ -68,7 +68,7 @@ cd indian-passport-photo-converter
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-streamlit run app.py
+streamlit run server.py
 ```
 
 Open **http://localhost:8501** in your browser.
@@ -82,7 +82,7 @@ docker run --rm -p 8501:8501 passport-photo-app
 
 ## Usage
 
-1. Open the [live app](https://indianpassportphoto-converter-594qkvflp9pkfixcgakszh.streamlit.app/) or run locally
+1. Open the [live app](https://passportphoto-converter.streamlit.app/) or run locally
 2. Upload a clear, front-facing portrait (JPG or PNG)
 3. Review the side-by-side preview and compliance report
 4. Optionally adjust brightness, contrast, zoom, or background whiteness
@@ -93,13 +93,16 @@ docker run --rm -p 8501:8501 passport-photo-app
 
 ```
 indian-passport-photo-converter/
+├── server.py               # ASGI entry (SEO routes + Streamlit app)
 ├── app.py                  # Streamlit application
+├── seo/                    # Google Search Console verification file
+├── docs/                   # GitHub Pages SEO landing page
 ├── report.py               # Daily dashboard report (KPIs, charts, email)
 ├── requirements.txt        # Python dependencies
 ├── runtime.txt             # Python version for Streamlit Cloud
 ├── Dockerfile              # Docker containerization
 ├── .github/workflows/      # GitHub Actions (daily report scheduling)
-├── .streamlit/             # Streamlit secrets (git-ignored)
+├── .streamlit/             # Streamlit config (secrets.toml is git-ignored)
 ├── assets/                 # App/README image assets
 │   ├── poster.png
 │   └── requirements.png
